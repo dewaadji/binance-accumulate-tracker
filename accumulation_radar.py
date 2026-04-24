@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-庄家收筹雷达 v1 — 发现庄家横盘吸筹 + OI异动
+Accumulation Radar v1 - detect sideways smart-money accumulation + OI anomalies
 
-核心逻辑（Patrick教的）：
-1. 庄家拉盘前必须先收筹 → 长期横盘+低量 = 收筹中
-2. OI暴涨 = 大资金进场建仓 = 即将拉盘
-3. 两个信号叠加 = 最强信号
+Core logic (from Patrick):
+1. Smart money must accumulate before a markup move -> long sideways action + low volume = accumulation in progress
+2. OI explosion = large capital entering and building positions = markup may be next
+3. When both signals overlap, the setup is strongest
 
-两个模块：
-A. 横盘收筹标的池（每天扫一次）→ 找正在被庄家收筹的币
-B. OI异动监控（每小时扫）→ 标的池内的币有OI异动立即报警
+Two modules:
+A. Sideways accumulation pool (scan once per day) -> find coins currently being accumulated
+B. OI anomaly monitor (scan hourly) -> alert immediately when a coin in the pool shows OI anomalies
 
-数据源：币安合约API（免费公开，零成本）
+Data source: Binance futures API (free public data, zero cost)
 """
 
 import json
@@ -23,7 +23,7 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-# === 加载 .env ===
+# === Load .env ===
 env_file = Path(__file__).parent / ".env.oi"
 if env_file.exists():
     with open(env_file) as f:
@@ -33,45 +33,67 @@ if env_file.exists():
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
 
-# === 配置 ===
+# === Config ===
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 FAPI = "https://fapi.binance.com"
-DB_PATH = Path(__file__).parent / "accumulation.db"
+_default_db_path = Path(__file__).parent / "accumulation.db"
+DB_PATH = Path(os.getenv("DB_PATH", str(_default_db_path)))
 
-# 收筹标的池参数
-MIN_SIDEWAYS_DAYS = 45        # 至少横盘45天
-MAX_RANGE_PCT = 80            # 横盘期价格波动<80%（宽松点，庄家盘波动可以大）
-MAX_AVG_VOL_USD = 20_000_000  # 日均成交<$20M（低量才是收筹）
-MIN_DATA_DAYS = 50            # 至少50天数据
+# Accumulation pool parameters
+MIN_SIDEWAYS_DAYS = 45        # At least 45 sideways days
+MAX_RANGE_PCT = 80            # Sideways period price range < 80% (loose threshold for operator-driven charts)
+MAX_AVG_VOL_USD = 20_000_000  # Average daily volume < $20M (low volume suggests accumulation)
+MIN_DATA_DAYS = 50            # At least 50 days of data
 
-# OI异动参数
-MIN_OI_DELTA_PCT = 3.0        # OI变化至少3%
-MIN_OI_USD = 2_000_000        # 最低OI门槛 $2M
+# OI anomaly parameters
+MIN_OI_DELTA_PCT = 3.0        # OI change must be at least 3%
+MIN_OI_USD = 2_000_000        # Minimum OI threshold: $2M
 
-# 放量突破参数
-VOL_BREAKOUT_MULT = 3.0       # 当日Vol > 3x均值 = 放量
+# Volume breakout parameter
+VOL_BREAKOUT_MULT = 3.0       # Daily volume > 3x average = breakout
+BLOCKED_ALERT_SENT = False
+
+
+def notify_data_blocked(reason=""):
+    """Send a one-time alert when upstream market data appears to be blocked."""
+    global BLOCKED_ALERT_SENT
+    if BLOCKED_ALERT_SENT:
+        return
+    BLOCKED_ALERT_SENT = True
+
+    msg = "Data gagal didapat, blocked starlink/provider"
+    if reason:
+        msg = f"{msg}\nReason: {reason}"
+    send_telegram(msg)
 
 
 def api_get(endpoint, params=None):
-    """币安API请求"""
+    """Send a Binance API request."""
     url = f"{FAPI}{endpoint}"
     for attempt in range(3):
         try:
             resp = requests.get(url, params=params, timeout=10)
             if resp.status_code == 200:
                 return resp.json()
+            elif resp.status_code in (403, 418, 451):
+                notify_data_blocked(f"HTTP {resp.status_code} from {endpoint}")
+                return None
             elif resp.status_code == 429:
                 time.sleep(2)
             else:
                 return None
-        except:
+        except requests.exceptions.RequestException as e:
+            # Connection-level errors often indicate ISP/provider-level blocking.
+            err = str(e).lower()
+            if "forbidden" in err or "blocked" in err or "connection reset" in err:
+                notify_data_blocked(f"request error on {endpoint}: {e}")
             time.sleep(1)
     return None
 
 
 def init_db():
-    """初始化数据库"""
+    """Initialize the database."""
     conn = sqlite3.connect(str(DB_PATH))
     c = conn.cursor()
     c.execute("""CREATE TABLE IF NOT EXISTS watchlist (
@@ -104,7 +126,7 @@ def init_db():
 
 
 def get_all_perp_symbols():
-    """获取所有USDT永续合约"""
+    """Fetch all USDT perpetual symbols."""
     info = api_get("/fapi/v1/exchangeInfo")
     if not info:
         return []
@@ -115,7 +137,7 @@ def get_all_perp_symbols():
 
 
 def analyze_accumulation(symbol, klines):
-    """分析单个币的收筹特征"""
+    """Analyze the accumulation characteristics of one coin."""
     if len(klines) < MIN_DATA_DAYS:
         return None
     
@@ -132,13 +154,13 @@ def analyze_accumulation(symbol, klines):
     
     coin = symbol.replace("USDT", "")
     
-    # === 排除稳定币和指数 ===
+    # === Exclude stablecoins and index products ===
     EXCLUDE = {"USDC", "USDP", "TUSD", "FDUSD", "BTCDOM", "DEFI", "USDM"}
     if coin in EXCLUDE:
         return None
     
-    # === 排除已经暴涨过+崩盘的币 ===
-    # 最近7天vs之前的均价，如果已经涨>300%就跳过（来不及了）
+    # === Exclude coins that already exploded and crashed ===
+    # Compare the last 7 days with the prior average price; skip if already up >300%
     recent_7d = data[-7:]
     prior = data[:-7]
     if not prior:
@@ -148,11 +170,11 @@ def analyze_accumulation(symbol, klines):
     prior_avg_px = sum(d["close"] for d in prior) / len(prior)
     
     if prior_avg_px > 0 and ((recent_avg_px - prior_avg_px) / prior_avg_px) > 3.0:
-        return None  # 已经涨了300%+，来不及了
+        return None  # Already up 300%+, too late
     
-    # === 寻找横盘区间 ===
-    # 从最近往回找，找最长的横盘期（价格波动<MAX_RANGE_PCT%）
-    # 关键：必须是真横盘（斜率接近零），阴跌不算横盘！
+    # === Find the sideways range ===
+    # Search backward from the most recent data to find the longest sideways period
+    # Key rule: it must be truly sideways (slope near zero); slow bleed is not sideways
     best_sideways = 0
     best_range = 0
     best_low = 0
@@ -160,7 +182,7 @@ def analyze_accumulation(symbol, klines):
     best_avg_vol = 0
     best_slope_pct = 0
     
-    # 用滑动窗口从60天到全部
+    # Use a sliding window from the minimum sideways period to the full history
     for window in range(MIN_SIDEWAYS_DAYS, len(prior) + 1):
         window_data = prior[-window:]
         lows = [d["low"] for d in window_data]
@@ -177,7 +199,7 @@ def analyze_accumulation(symbol, klines):
         if range_pct <= MAX_RANGE_PCT:
             avg_vol = sum(d["vol"] for d in window_data) / len(window_data)
             if avg_vol <= MAX_AVG_VOL_USD:
-                # 线性回归算斜率：阴跌/暴涨不算横盘
+                # Use linear regression for slope: slow bleed or vertical markup is not sideways
                 closes = [d["close"] for d in window_data]
                 n = len(closes)
                 x_mean = (n - 1) / 2.0
@@ -185,10 +207,10 @@ def analyze_accumulation(symbol, klines):
                 num = sum((i - x_mean) * (c - y_mean) for i, c in enumerate(closes))
                 den = sum((i - x_mean) ** 2 for i in range(n))
                 slope = num / den if den > 0 else 0
-                # 累计变化占起始价的百分比
+                # Cumulative change as a percentage of the starting price
                 slope_pct = (slope * n / closes[0] * 100) if closes[0] > 0 else 0
                 
-                # 斜率过滤：累计变化超过±20%不算横盘
+                # Slope filter: cumulative change beyond +/-20% is not sideways
                 if abs(slope_pct) > 20:
                     continue
                 
@@ -203,27 +225,27 @@ def analyze_accumulation(symbol, klines):
     if best_sideways < MIN_SIDEWAYS_DAYS:
         return None
     
-    # === 计算收筹评分 ===
-    # 横盘越久越好（庄家需要时间吸筹）
-    days_score = min(best_sideways / 90, 1.0) * 25  # 90天满分25
+    # === Compute accumulation score ===
+    # Longer sideways action is better because accumulation takes time
+    days_score = min(best_sideways / 90, 1.0) * 25  # Full 25 points at 90 days
     
-    # 区间越窄越好（控盘紧）
-    range_score = max(0, (1 - best_range / MAX_RANGE_PCT)) * 20  # 越窄越高，满分20
+    # Narrower range is better because price control is tighter
+    range_score = max(0, (1 - best_range / MAX_RANGE_PCT)) * 20  # Narrower is better, max 20
     
-    # 成交量越低越好（死水一潭 = 筹码集中）
-    vol_score = max(0, (1 - best_avg_vol / MAX_AVG_VOL_USD)) * 20  # 越低越高，满分20
+    # Lower volume is better because dead volume often means supply is concentrated
+    vol_score = max(0, (1 - best_avg_vol / MAX_AVG_VOL_USD)) * 20  # Lower is better, max 20
     
-    # 最近是否开始放量？（放量是启动信号）
+    # Has volume started expanding recently? A breakout in volume is an activation signal
     recent_vol = sum(d["vol"] for d in recent_7d) / len(recent_7d)
     vol_breakout = recent_vol / best_avg_vol if best_avg_vol > 0 else 0
-    breakout_score = min(vol_breakout / VOL_BREAKOUT_MULT, 1.0) * 15  # 放量加分，满分15
+    breakout_score = min(vol_breakout / VOL_BREAKOUT_MULT, 1.0) * 15  # Volume expansion bonus, max 15
     
-    # 市值越低空间越大（核心！Patrick: 低市值=大空间）
-    # 用当前价格*日均成交量/换手率来粗估市值排名
-    # 实际市值在推送时用CoinGecko补充
-    est_mcap = data[-1]["close"] * best_avg_vol * 30  # 粗略估算
+    # Lower market cap usually means more upside
+    # Rough market-cap estimate from current price * avg daily quote volume * multiplier
+    # The notification flow later supplements this with a more realistic market cap
+    est_mcap = data[-1]["close"] * best_avg_vol * 30  # Rough estimate
     if est_mcap > 0 and est_mcap < 50_000_000:
-        mcap_score = 20  # <$50M 满分
+        mcap_score = 20  # Full score below $50M
     elif est_mcap < 100_000_000:
         mcap_score = 15
     elif est_mcap < 200_000_000:
@@ -235,17 +257,17 @@ def analyze_accumulation(symbol, klines):
     
     total_score = days_score + range_score + vol_score + breakout_score + mcap_score
     
-    # 横盘质量加分：斜率越接近零越好（真横盘bonus，满分+5）
+    # Flatness bonus: the closer the slope is to zero, the better
     flatness_bonus = max(0, (1 - abs(best_slope_pct) / 20)) * 5
     total_score += flatness_bonus
     
-    # 状态判断
+    # Status label
     if vol_breakout >= VOL_BREAKOUT_MULT:
-        status = "🔥放量启动"
+        status = "🔥Volume Breakout"
     elif vol_breakout >= 1.5:
-        status = "⚡开始放量"
+        status = "⚡Volume Picking Up"
     else:
-        status = "💤收筹中"
+        status = "💤Accumulating"
     
     return {
         "symbol": symbol,
@@ -266,11 +288,14 @@ def analyze_accumulation(symbol, klines):
 
 
 def scan_accumulation_pool():
-    """扫描全市场，找正在被收筹的币"""
-    print("📊 扫描全市场收筹标的...")
+    """Scan the market and find coins that appear to be under accumulation."""
+    print("📊 Scanning the full market for accumulation candidates...")
     
     symbols = get_all_perp_symbols()
-    print(f"  共 {len(symbols)} 个合约")
+    if not symbols:
+        notify_data_blocked("no symbols returned from exchangeInfo")
+        return []
+    print(f"  Total contracts: {len(symbols)}")
     
     results = []
     
@@ -287,21 +312,21 @@ def scan_accumulation_pool():
         if (i + 1) % 10 == 0:
             time.sleep(0.5)
         if (i + 1) % 100 == 0:
-            print(f"  进度: {i+1}/{len(symbols)}... 已发现{len(results)}个")
+            print(f"  Progress: {i+1}/{len(symbols)}... found {len(results)} so far")
     
     results.sort(key=lambda x: x["score"], reverse=True)
-    print(f"  ✅ 发现 {len(results)} 个收筹标的")
+    print(f"  ✅ Found {len(results)} accumulation candidates")
     return results
 
 
 def scan_oi_changes(watchlist_symbols):
-    """对标的池内的币扫描OI异动"""
-    print(f"📊 扫描OI异动（{len(watchlist_symbols)}个标的）...")
+    """Scan the watchlist for OI anomalies."""
+    print(f"📊 Scanning OI anomalies ({len(watchlist_symbols)} symbols)...")
     
     alerts = []
     
     for sym in watchlist_symbols:
-        # OI历史
+        # OI history
         oi_hist = api_get("/futures/data/openInterestHist", {
             "symbol": sym, "period": "1h", "limit": 3
         })
@@ -318,7 +343,7 @@ def scan_oi_changes(watchlist_symbols):
         delta_pct = ((curr_oi - prev_oi) / prev_oi) * 100
         
         if abs(delta_pct) >= MIN_OI_DELTA_PCT:
-            # 拿当前价格
+            # Get current price
             ticker = api_get("/fapi/v1/ticker/24hr", {"symbol": sym})
             if not ticker:
                 continue
@@ -327,7 +352,7 @@ def scan_oi_changes(watchlist_symbols):
             vol_24h = float(ticker["quoteVolume"])
             px_chg = float(ticker["priceChangePercent"])
             
-            # 拿费率
+            # Get funding rate
             funding = api_get("/fapi/v1/fundingRate", {"symbol": sym, "limit": 1})
             fr = float(funding[0]["fundingRate"]) if funding else 0
             
@@ -348,7 +373,7 @@ def scan_oi_changes(watchlist_symbols):
         time.sleep(0.3)
     
     alerts.sort(key=lambda x: abs(x["oi_delta_pct"]), reverse=True)
-    print(f"  ✅ 发现 {len(alerts)} 个OI异动")
+    print(f"  ✅ Found {len(alerts)} OI anomalies")
     return alerts
 
 
@@ -360,109 +385,109 @@ def format_usd(v):
 
 
 def build_pool_report(results, top_n=25):
-    """生成收筹标的池报告"""
+    """Build the accumulation-pool report."""
     if not results:
         return ""
     
     now = datetime.now(timezone(timedelta(hours=8)))
     
     lines = [
-        f"🏦 **庄家收筹雷达** — 标的池更新",
+        f"🏦 **Accumulation Radar** - Pool Update",
         f"⏰ {now.strftime('%Y-%m-%d %H:%M')} CST",
         f"━━━━━━━━━━━━━━━━━━",
-        f"扫描 {len(results)} 个合约，发现标的：",
+        f"Scanned {len(results)} contracts. Candidates found:",
         "",
     ]
     
-    # 分组：放量启动 > 开始放量 > 收筹中
-    firing = [r for r in results if "放量启动" in r["status"]]
-    warming = [r for r in results if "开始放量" in r["status"]]
-    sleeping = [r for r in results if "收筹中" in r["status"]]
+    # Groups: breakout > warming up > still accumulating
+    firing = [r for r in results if "Volume Breakout" in r["status"]]
+    warming = [r for r in results if "Volume Picking Up" in r["status"]]
+    sleeping = [r for r in results if "Accumulating" in r["status"]]
     
     if firing:
-        lines.append(f"🔥 **放量启动** ({len(firing)}个) — 最高优先级！")
+        lines.append(f"🔥 **Volume Breakout** ({len(firing)}) - Highest priority")
         for r in firing[:10]:
             lines.append(
-                f"  🔥 **{r['coin']}** | 分:{r['score']:.0f} | "
-                f"横盘{r['sideways_days']}天 | 波动{r['range_pct']:.0f}% | "
-                f"Vol放大{r['vol_breakout']:.1f}x"
+                f"  🔥 **{r['coin']}** | Score:{r['score']:.0f} | "
+                f"Sideways {r['sideways_days']}d | Range {r['range_pct']:.0f}% | "
+                f"Volume {r['vol_breakout']:.1f}x"
             )
             lines.append(
                 f"     ${r['current_price']:.6f} | "
-                f"区间: ${r['low_price']:.6f}~${r['high_price']:.6f} | "
-                f"日均Vol: {format_usd(r['avg_vol'])}"
+                f"Range: ${r['low_price']:.6f}~${r['high_price']:.6f} | "
+                f"Avg daily volume: {format_usd(r['avg_vol'])}"
             )
         lines.append("")
     
     if warming:
-        lines.append(f"⚡ **开始放量** ({len(warming)}个) — 关注中")
+        lines.append(f"⚡ **Volume Picking Up** ({len(warming)}) - On watch")
         for r in warming[:10]:
             lines.append(
-                f"  ⚡ {r['coin']} | 分:{r['score']:.0f} | "
-                f"横盘{r['sideways_days']}天 | 波动{r['range_pct']:.0f}% | "
-                f"Vol{r['vol_breakout']:.1f}x"
+                f"  ⚡ {r['coin']} | Score:{r['score']:.0f} | "
+                f"Sideways {r['sideways_days']}d | Range {r['range_pct']:.0f}% | "
+                f"Vol {r['vol_breakout']:.1f}x"
             )
         lines.append("")
     
     if sleeping:
-        lines.append(f"💤 **收筹中** ({len(sleeping)}个) — 持续监控")
+        lines.append(f"💤 **Accumulating** ({len(sleeping)}) - Keep monitoring")
         for r in sleeping[:15]:
             lines.append(
-                f"  💤 {r['coin']} | 分:{r['score']:.0f} | "
-                f"横盘{r['sideways_days']}天 | 波动{r['range_pct']:.0f}% | "
-                f"日均Vol {format_usd(r['avg_vol'])}"
+                f"  💤 {r['coin']} | Score:{r['score']:.0f} | "
+                f"Sideways {r['sideways_days']}d | Range {r['range_pct']:.0f}% | "
+                f"Avg daily volume {format_usd(r['avg_vol'])}"
             )
     
     return "\n".join(lines)
 
 
 def build_oi_alert_report(alerts, watchlist_coins):
-    """生成OI异动报告（只报标的池内的）"""
+    """Build the OI anomaly report for the watchlist."""
     if not alerts:
         return ""
     
     now = datetime.now(timezone(timedelta(hours=8)))
     
-    # 区分：池内 vs 池外
+    # Split into in-pool vs out-of-pool
     in_pool = [a for a in alerts if a["symbol"] in watchlist_coins]
     out_pool = [a for a in alerts if a["symbol"] not in watchlist_coins]
     
     lines = [
-        f"📊 **OI异动扫描** [收筹池]",
+        f"📊 **OI Anomaly Scan** [Accumulation Pool]",
         f"⏰ {now.strftime('%Y-%m-%d %H:%M')} CST",
         f"━━━━━━━━━━━━━━━━━━",
         "",
     ]
     
     if in_pool:
-        lines.append(f"🎯 **收筹池内异动** ({len(in_pool)}个) ⚠️ 重点关注!")
+        lines.append(f"🎯 **In-Pool Anomalies** ({len(in_pool)}) ⚠️ Priority watch")
         for a in in_pool[:10]:
             emoji = "🟢" if a["oi_delta_pct"] > 0 else "🔴"
             lines.append(
                 f"  {emoji} **{a['coin']}** | OI: {a['oi_delta_pct']:+.1f}% "
-                f"({format_usd(a['oi_usd'])}) | 价格: {a['px_chg_pct']:+.1f}%"
+                f"({format_usd(a['oi_usd'])}) | Price: {a['px_chg_pct']:+.1f}%"
             )
-            # 信号解读
+            # Signal interpretation
             if a["oi_delta_pct"] > 0 and abs(a["px_chg_pct"]) < 3:
-                lines.append(f"     ⚡ 暗流涌动！OI涨但价格平 = 庄家建仓中")
+                lines.append(f"     ⚡ Underflow! OI is rising while price is flat = position building")
             elif a["oi_delta_pct"] > 0 and a["px_chg_pct"] > 3:
-                lines.append(f"     🚀 放量拉升！OI+价格同涨 = 启动中")
+                lines.append(f"     🚀 Breakout in progress! OI and price are rising together")
         lines.append("")
     
     if out_pool:
-        lines.append(f"📋 池外异动 ({len(out_pool)}个)")
+        lines.append(f"📋 Out-of-Pool Anomalies ({len(out_pool)})")
         for a in out_pool[:8]:
             emoji = "🟢" if a["oi_delta_pct"] > 0 else "🔴"
             lines.append(
                 f"  {emoji} {a['coin']} | OI: {a['oi_delta_pct']:+.1f}% | "
-                f"价格: {a['px_chg_pct']:+.1f}%"
+                f"Price: {a['px_chg_pct']:+.1f}%"
             )
     
     return "\n".join(lines)
 
 
 def send_telegram(text):
-    """发送TG消息"""
+    """Send a Telegram message."""
     if not TG_BOT_TOKEN:
         print("\n[TG] No token, stdout:\n")
         print(text)
@@ -470,7 +495,7 @@ def send_telegram(text):
     
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     
-    # 分段发送（TG限制4096字）
+    # Send in chunks (Telegram limit is 4096 chars)
     chunks = []
     current = ""
     for line in text.split("\n"):
@@ -492,7 +517,7 @@ def send_telegram(text):
             if resp.status_code == 200:
                 print(f"[TG] Sent ✓ ({len(chunk)} chars)")
             else:
-                # Markdown失败就用纯文本
+                # Fall back to plain text if Markdown fails
                 resp2 = requests.post(url, json={
                     "chat_id": TG_CHAT_ID,
                     "text": chunk.replace("*", "").replace("_", ""),
@@ -504,7 +529,7 @@ def send_telegram(text):
 
 
 def save_watchlist(conn, results):
-    """保存标的池到数据库"""
+    """Save the pool to the database."""
     c = conn.cursor()
     now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
     
@@ -518,19 +543,19 @@ def save_watchlist(conn, results):
              r["score"], r["status"]))
     
     conn.commit()
-    print(f"  💾 保存 {len(results)} 个标的到数据库")
+    print(f"  💾 Saved {len(results)} symbols to the database")
 
 
 def load_watchlist_symbols(conn):
-    """从数据库加载标的池"""
+    """Load the watchlist symbols from the database."""
     c = conn.cursor()
     c.execute("SELECT symbol FROM watchlist WHERE status != 'removed'")
     return [row[0] for row in c.fetchall()]
 
 
 def scan_short_fuel():
-    """策略2: 空头燃料 — 涨了+费率负+OI大 = 庄家拉盘爆空单"""
-    print("📊 扫描空头燃料（费率为负+在涨的币）...")
+    """Strategy 2: short fuel - rising price + negative funding + high OI."""
+    print("📊 Scanning short fuel (negative funding + rising coins)...")
     
     tickers = api_get("/fapi/v1/ticker/24hr")
     premiums = api_get("/fapi/v1/premiumIndex")
@@ -541,8 +566,8 @@ def scan_short_fuel():
     funding_map = {p["symbol"]: float(p["lastFundingRate"]) 
                    for p in premiums if p["symbol"].endswith("USDT")}
     
-    fuel_targets = []     # 已在涨+费率负 = 正在squeeze
-    squeeze_targets = []  # 费率极负+还没大涨 = 潜在squeeze
+    fuel_targets = []     # Already rising + negative funding = active squeeze
+    squeeze_targets = []  # Extremely negative funding + no big move yet = potential squeeze
     
     for t in tickers:
         sym = t["symbol"]
@@ -561,12 +586,12 @@ def scan_short_fuel():
             "vol": vol, "price": price,
         }
         
-        # 正在squeeze: 涨>5% + 费率负 + Vol>$5M
+        # Active squeeze: price >5% + negative funding + volume >$5M
         if px_chg > 5 and fr < -0.0003 and vol > 5_000_000:
             item["fuel_score"] = abs(fr) * 10000 * px_chg
             fuel_targets.append(item)
         
-        # 潜在squeeze: 费率很负 + 还没大涨(<10%) + Vol>$2M
+        # Potential squeeze: very negative funding + not up too much yet (<10%) + volume >$2M
         elif fr < -0.0005 and px_chg < 10 and vol > 2_000_000:
             item["fuel_score"] = abs(fr) * 10000
             squeeze_targets.append(item)
@@ -574,42 +599,42 @@ def scan_short_fuel():
     fuel_targets.sort(key=lambda x: x["fuel_score"], reverse=True)
     squeeze_targets.sort(key=lambda x: x["fuel_score"], reverse=True)
     
-    print(f"  ✅ 正在squeeze: {len(fuel_targets)}个, 潜在squeeze: {len(squeeze_targets)}个")
+    print(f"  ✅ Active squeezes: {len(fuel_targets)}, potential squeezes: {len(squeeze_targets)}")
     return fuel_targets, squeeze_targets
 
 
 def build_fuel_report(fuel_targets, squeeze_targets):
-    """生成空头燃料报告"""
+    """Build the short-fuel report."""
     if not fuel_targets and not squeeze_targets:
         return ""
     
     now = datetime.now(timezone(timedelta(hours=8)))
     lines = [
-        f"🔥 **空头燃料扫描**",
+        f"🔥 **Short Fuel Scan**",
         f"⏰ {now.strftime('%Y-%m-%d %H:%M')} CST",
         f"━━━━━━━━━━━━━━━━━━",
-        f"逻辑：费率负=大量做空，庄家拉盘爆空单+收资金费",
+        f"Logic: negative funding = lots of shorts, which can fuel squeezes and generate funding income",
         "",
     ]
     
     if fuel_targets:
-        lines.append(f"🚀 **正在Squeeze** ({len(fuel_targets)}个) — 涨了+空头还在扛")
+        lines.append(f"🚀 **Active Squeezes** ({len(fuel_targets)}) - price is up and shorts are still holding")
         for t in fuel_targets[:8]:
             fr_pct = t["funding"] * 100
-            flag = "🎯极度!" if fr_pct < -0.1 else "⚠️"
+            flag = "🎯Extreme!" if fr_pct < -0.1 else "⚠️"
             lines.append(
-                f"  {flag} **{t['coin']}** | 涨{t['px_chg']:+.1f}% | "
-                f"费率🧊{fr_pct:.4f}% | Vol {format_usd(t['vol'])}"
+                f"  {flag} **{t['coin']}** | Move {t['px_chg']:+.1f}% | "
+                f"Funding 🧊{fr_pct:.4f}% | Vol {format_usd(t['vol'])}"
             )
         lines.append("")
     
     if squeeze_targets:
-        lines.append(f"🎯 **潜在Squeeze** ({len(squeeze_targets)}个) — 费率极负+还没大涨")
+        lines.append(f"🎯 **Potential Squeezes** ({len(squeeze_targets)}) - deeply negative funding, not up too much yet")
         for t in squeeze_targets[:8]:
             fr_pct = t["funding"] * 100
             lines.append(
-                f"  🧊 {t['coin']} | 价格{t['px_chg']:+.1f}% | "
-                f"费率{fr_pct:.4f}% | Vol {format_usd(t['vol'])}"
+                f"  🧊 {t['coin']} | Price {t['px_chg']:+.1f}% | "
+                f"Funding {fr_pct:.4f}% | Vol {format_usd(t['vol'])}"
             )
     
     return "\n".join(lines)
@@ -618,13 +643,13 @@ def build_fuel_report(fuel_targets, squeeze_targets):
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
     
-    print(f"🏦 庄家收筹雷达 v1 — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"   模式: {mode}\n")
+    print(f"🏦 Accumulation Radar v1 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"   Mode: {mode}\n")
     
     conn = init_db()
     
     if mode in ("full", "pool"):
-        # === 模块A: 更新收筹标的池 ===
+        # === Module A: update the accumulation pool ===
         results = scan_accumulation_pool()
         
         if results:
@@ -634,21 +659,23 @@ def main():
                 send_telegram(report)
     
     if mode in ("full", "oi"):
-        # === 综合扫描：OI + 费率 + 收筹 三维合一 ===
+        # === Combined scan: OI + funding + accumulation in one pass ===
         watchlist = load_watchlist_symbols(conn)
         watchlist_set = set(watchlist)
         
         if not watchlist:
-            print("⚠️ 标的池为空，先运行 pool 模式")
+            print("⚠️ Watchlist is empty, run `pool` mode first")
+            notify_data_blocked("watchlist empty after loading from DB")
             conn.close()
             return
         
-        # 1. 拿全市场费率+行情
+        # 1. Fetch market-wide funding + ticker data
         tickers_raw = api_get("/fapi/v1/ticker/24hr")
         premiums_raw = api_get("/fapi/v1/premiumIndex")
         
         if not tickers_raw or not premiums_raw:
-            print("❌ API失败")
+            print("❌ API request failed")
+            notify_data_blocked("ticker/premium endpoints returned empty data")
             conn.close()
             return
         
@@ -666,8 +693,8 @@ def main():
             if p["symbol"].endswith("USDT"):
                 funding_map[p["symbol"]] = float(p["lastFundingRate"])
         
-        # 1.5 拉真实流通市值（币安现货API，一次全量）
-        mcap_map = {}  # coin名 -> marketCap
+        # 1.5 Fetch real circulating market caps from the Binance spot API
+        mcap_map = {}  # coin name -> marketCap
         try:
             import requests as _req
             _r = _req.get("https://www.binance.com/bapi/composite/v1/public/marketing/symbol/list", timeout=10)
@@ -677,12 +704,12 @@ def main():
                     mc = item.get("marketCap", 0)
                     if name and mc:
                         mcap_map[name] = float(mc)
-                print(f"✅ 拉到 {len(mcap_map)} 个币的真实市值")
+                print(f"✅ Pulled real market caps for {len(mcap_map)} coins")
         except Exception as e:
-            print(f"⚠️ 市值API失败，走fallback: {e}")
+            print(f"⚠️ Market-cap API failed, using fallback: {e}")
         
-        # 2. 拉热度数据（CoinGecko Trending + 成交量暴增）
-        heat_map = {}  # coin名 -> heat_score (0-100)
+        # 2. Fetch heat data (CoinGecko Trending + volume surges)
+        heat_map = {}  # coin name -> heat_score (0-100)
         cg_trending = set()
         try:
             import requests as _req
@@ -692,48 +719,48 @@ def main():
                     sym = item["item"]["symbol"].upper()
                     rank = item["item"].get("score", 99)
                     cg_trending.add(sym)
-                    heat_map[sym] = heat_map.get(sym, 0) + max(50 - rank * 3, 10)  # top1=50分, top10=20分
-                print(f"🔥 CoinGecko Trending: {len(cg_trending)}个币")
+                    heat_map[sym] = heat_map.get(sym, 0) + max(50 - rank * 3, 10)  # top1=50 pts, top10=20 pts
+                print(f"🔥 CoinGecko Trending: {len(cg_trending)} coins")
         except Exception as e:
-            print(f"⚠️ CG Trending失败: {e}")
+            print(f"⚠️ CoinGecko Trending failed: {e}")
         
-        # 成交量暴增检测（24hVol vs 5日均Vol）
+        # Volume surge detection (24h volume vs 5-day average)
         vol_surge_coins = set()
         for sym, tk in ticker_map.items():
             coin = sym.replace("USDT", "")
             vol_24h = tk["vol"]
-            # 快速拿5天均量（用ticker的数据粗估，精确版在后面OI扫描时补充）
-            # 这里先标记vol > $20M的为候选
+            # Quick 5-day average volume check; exact detail can be refined later
+            # First, only consider coins with 24h volume > $20M
             if vol_24h > 20_000_000:
                 kl = api_get("/fapi/v1/klines", {"symbol": sym, "interval": "1d", "limit": 6})
                 if kl and len(kl) >= 5:
                     avg_5d = sum(float(k[7]) for k in kl[:-1]) / (len(kl)-1)
                     if avg_5d > 0:
                         ratio = vol_24h / avg_5d
-                        if ratio >= 2.5:  # 成交量放大2.5倍以上
+                        if ratio >= 2.5:  # Volume expanded by at least 2.5x
                             vol_surge_coins.add(coin)
-                            heat_map[coin] = heat_map.get(coin, 0) + min(ratio * 10, 50)  # 最高50分
+                            heat_map[coin] = heat_map.get(coin, 0) + min(ratio * 10, 50)  # Cap at 50 points
                     import time; time.sleep(0.05)
         
-        print(f"📈 成交量暴增(≥2.5x): {len(vol_surge_coins)}个币")
-        # 双重热度
+        print(f"📈 Volume surges (>=2.5x): {len(vol_surge_coins)} coins")
+        # Double heat
         dual_heat = cg_trending & vol_surge_coins
         if dual_heat:
             for coin in dual_heat:
-                heat_map[coin] = heat_map.get(coin, 0) + 20  # 双重信号bonus
-            print(f"🔥🔥 双重热度: {dual_heat}")
+                heat_map[coin] = heat_map.get(coin, 0) + 20  # Double-signal bonus
+            print(f"🔥🔥 Dual heat: {dual_heat}")
         
-        # 3. 从DB读收筹数据
+        # 3. Read accumulation data from the database
         c2 = conn.cursor()
         c2.execute("SELECT symbol, score, sideways_days, range_pct, avg_vol, status FROM watchlist")
         pool_map = {}
         for row in c2.fetchall():
             pool_map[row[0]] = {"pool_score": row[1], "sideways_days": row[2], "range_pct": row[3], "avg_vol": row[4], "status": row[5]}
         
-        # 3. 扫OI（标的池中放量的 + Top100）
+        # 4. Scan OI for volume-expanding pool members + top-100 by volume
         scan_syms = set()
         for sym, pd in pool_map.items():
-            if "放量" in pd.get("status", "") or "开始" in pd.get("status", ""):
+            if "Volume" in pd.get("status", ""):
                 scan_syms.add(sym)
         top_by_vol = sorted(ticker_map.items(), key=lambda x: x[1]["vol"], reverse=True)[:100]
         for sym, _ in top_by_vol:
@@ -753,9 +780,9 @@ def main():
             if (i+1) % 10 == 0:
                 import time; time.sleep(0.5)
         
-        # 4. 三策略独立评分
+        # 5. Score the three strategies independently
         
-        # 共用数据预处理
+        # Shared preprocessing
         all_syms = set(list(pool_map.keys()) + list(oi_map.keys()))
         coin_data = {}
         for sym in all_syms:
@@ -769,7 +796,7 @@ def main():
             d6h = oi.get("d6h", 0)
             fr_pct = fr * 100
             oi_usd = oi.get("oi_usd", 0)
-            # 真实流通市值：优先现货API，fallback合约OI接口的CMC数据，最后粗估
+            # Real circulating market cap: spot API first, then CMC supply from OI endpoint, then rough estimate
             if coin in mcap_map:
                 est_mcap = mcap_map[coin]
             else:
@@ -796,32 +823,32 @@ def main():
             }
         
         # ═══════════════════════════════════════
-        # 策略1: 追多 — 纯费率排名
+        # Strategy 1: momentum chase - pure funding ranking
         # ═══════════════════════════════════════
         chase = []
         for sym, d in coin_data.items():
             if d["px_chg"] > 3 and d["fr_pct"] < -0.005 and d["vol"] > 1_000_000:
-                # 查费率趋势
+                # Check funding trend
                 fr_hist = api_get("/fapi/v1/fundingRate", {"symbol": sym, "limit": 5})
                 fr_rates = [float(f["fundingRate"]) * 100 for f in fr_hist] if fr_hist else [d["fr_pct"]]
                 fr_prev = fr_rates[-2] if len(fr_rates) >= 2 else d["fr_pct"]
                 fr_delta = d["fr_pct"] - fr_prev
                 
-                trend = "🔥加速" if fr_delta < -0.05 else "⬇️变负" if fr_delta < -0.01 else "➡️" if abs(fr_delta) < 0.01 else "⬆️回升"
+                trend = "🔥Accelerating" if fr_delta < -0.05 else "⬇️Turned Negative" if fr_delta < -0.01 else "➡️" if abs(fr_delta) < 0.01 else "⬆️Rebounding"
                 
                 chase.append({**d, "fr_delta": fr_delta, "trend": trend,
                               "rates": " → ".join([f"{x:.3f}" for x in fr_rates[-3:]])})
                 import time; time.sleep(0.2)
         
-        # 纯按费率绝对值排序（越负越前）
+        # Sort purely by funding rate, most negative first
         chase.sort(key=lambda x: x["fr_pct"])
         
         # ═══════════════════════════════════════
-        # 策略2: 综合 — 各维度均衡(各25分)
+        # Strategy 2: combined - balanced across all four dimensions
         # ═══════════════════════════════════════
         combined = []
         for sym, d in coin_data.items():
-            # 费率分(25) — 越负越好
+            # Funding score (25) - more negative is better
             fr = d["fr_pct"]
             if fr < -0.5: f_sc = 25
             elif fr < -0.1: f_sc = 22
@@ -831,7 +858,7 @@ def main():
             elif fr < 0: f_sc = 5
             else: f_sc = 0
             
-            # 市值分(25) — 用真实流通市值
+            # Market-cap score (25) - use real circulating market cap
             mc = d["est_mcap"]
             if mc > 0 and mc < 50e6: m_sc = 25
             elif mc < 100e6: m_sc = 22
@@ -841,7 +868,7 @@ def main():
             elif mc < 1e9: m_sc = 7
             else: m_sc = 0
             
-            # 横盘分(25)
+            # Sideways score (25)
             sw = d["sw_days"]
             if sw >= 120: s_sc = 25
             elif sw >= 90: s_sc = 22
@@ -850,7 +877,7 @@ def main():
             elif sw >= 45: s_sc = 10
             else: s_sc = 0
             
-            # OI分(25)
+            # OI score (25)
             abs6 = abs(d["d6h"])
             if abs6 >= 15: o_sc = 25
             elif abs6 >= 8: o_sc = 22
@@ -868,14 +895,14 @@ def main():
         combined.sort(key=lambda x: x["total"], reverse=True)
         
         # ═══════════════════════════════════════
-        # 策略3: 埋伏 — 市值>OI>横盘>费率
+        # Strategy 3: ambush - market cap > OI > sideways > funding
         # ═══════════════════════════════════════
         ambush = []
         for sym, d in coin_data.items():
-            if not d["in_pool"]: continue  # 必须在收筹池
-            if d["px_chg"] > 50: continue  # 已经暴涨的排除
+            if not d["in_pool"]: continue  # Must be in the accumulation pool
+            if d["px_chg"] > 50: continue  # Exclude coins that already exploded
             
-            # 1.市值(35分) — 核心！越低越好（真实流通市值）
+            # 1. Market cap (35) - the lower, the better
             mc = d["est_mcap"]
             if mc > 0 and mc < 50e6: m_sc = 35
             elif mc < 100e6: m_sc = 32
@@ -886,7 +913,7 @@ def main():
             elif mc < 1e9: m_sc = 5
             else: m_sc = 0
             
-            # 2.OI异动(30分) — OI涨+市值低=极好
+            # 2. OI anomaly (30) - rising OI plus low market cap is excellent
             abs6 = abs(d["d6h"])
             if abs6 >= 10: o_sc = 30
             elif abs6 >= 5: o_sc = 25
@@ -894,11 +921,11 @@ def main():
             elif abs6 >= 2: o_sc = 14
             elif abs6 >= 1: o_sc = 8
             else: o_sc = 0
-            # 暗流加分：OI涨但价格平
+            # Underflow bonus: OI rises while price stays flat
             if d["d6h"] > 2 and abs(d["px_chg"]) < 5:
                 o_sc = min(o_sc + 5, 30)
             
-            # 3.横盘(20分)
+            # 3. Sideways action (20)
             sw = d["sw_days"]
             if sw >= 120: s_sc = 20
             elif sw >= 90: s_sc = 17
@@ -907,7 +934,7 @@ def main():
             elif sw >= 45: s_sc = 6
             else: s_sc = 0
             
-            # 4.负费率(15分) — 有负费率是bonus
+            # 4. Negative funding (15) - negative funding is a bonus
             fr = d["fr_pct"]
             if fr < -0.1: f_sc = 15
             elif fr < -0.05: f_sc = 12
@@ -925,7 +952,7 @@ def main():
         ambush.sort(key=lambda x: x["total"], reverse=True)
         
         # ═══════════════════════════════════════
-        # 5. 生成推送 + 值得关注提醒
+        # 6. Build notification + worth-watching highlights
         # ═══════════════════════════════════════
         def mcap_str(v):
             if v >= 1e6: return f"${v/1e6:.0f}M"
@@ -934,125 +961,125 @@ def main():
         
         now = datetime.now(timezone(timedelta(hours=8)))
         lines = [
-            f"🏦 **庄家雷达** 三策略+热度",
+            f"🏦 **Smart Money Radar** - Three Strategies + Heat",
             f"⏰ {now.strftime('%Y-%m-%d %H:%M')} CST",
         ]
         
-        # 表0: 热度榜（最重要，放最前面）
+        # Table 0: heat ranking (most important, put first)
         hot_coins = sorted(
             [d for d in coin_data.values() if d["heat"] > 0],
             key=lambda x: x["heat"], reverse=True
         )
         if hot_coins:
-            lines.append(f"\n🔥 **热度榜** (CG趋势+成交量暴增)")
+            lines.append(f"\n🔥 **Heat Ranking** (CG trending + volume surge)")
             for s in hot_coins[:8]:
                 tags = []
-                if s["in_cg"]: tags.append("🌐CG热搜")
-                if s["vol_surge"]: tags.append("📈放量")
+                if s["in_cg"]: tags.append("🌐CG Trending")
+                if s["vol_surge"]: tags.append("📈Volume Surge")
                 oi_tag = f"OI{s['d6h']:+.0f}%" if abs(s["d6h"]) >= 3 else ""
                 if oi_tag: tags.append(f"⚡{oi_tag}")
-                if s["in_pool"]: tags.append(f"💤池{s['sw_days']}天")
+                if s["in_pool"]: tags.append(f"💤Pool {s['sw_days']}d")
                 fr_tag = f"🧊{s['fr_pct']:.2f}%" if s["fr_pct"] < -0.03 else ""
                 if fr_tag: tags.append(fr_tag)
                 lines.append(
-                    f"  {s['coin']:<8} ~{mcap_str(s['est_mcap'])} 涨{s['px_chg']:+.0f}% | {' '.join(tags)}"
+                    f"  {s['coin']:<8} ~{mcap_str(s['est_mcap'])} Move {s['px_chg']:+.0f}% | {' '.join(tags)}"
                 )
         
-        # 表1: 追多
-        lines.append(f"\n🔥 **追多** (按费率排名)")
+        # Table 1: momentum chase
+        lines.append(f"\n🔥 **Momentum Chase** (ranked by funding)")
         if chase:
             for s in chase[:8]:
                 lines.append(
-                    f"  {s['coin']:<7} 费率{s['fr_pct']:+.3f}% {s['trend']}"
-                    f" | 涨{s['px_chg']:+.0f}% | ~{mcap_str(s['est_mcap'])}"
+                    f"  {s['coin']:<7} Funding {s['fr_pct']:+.3f}% {s['trend']}"
+                    f" | Move {s['px_chg']:+.0f}% | ~{mcap_str(s['est_mcap'])}"
                 )
         else:
-            lines.append("  暂无（需涨>3%+费率负）")
+            lines.append("  None yet (requires move >3% + negative funding)")
         
-        # 表2: 综合
-        lines.append(f"\n📊 **综合** (费率+市值+横盘+OI 各25)")
+        # Table 2: combined
+        lines.append(f"\n📊 **Combined** (Funding + Market Cap + Sideways + OI, 25 each)")
         for s in combined[:8]:
             dims = []
             if s["f_sc"] >= 10: dims.append(f"🧊{s['fr_pct']:.2f}%")
             if s["m_sc"] >= 12: dims.append(f"💎{mcap_str(s['est_mcap'])}")
-            if s["s_sc"] >= 10: dims.append(f"💤{s['sw_days']}天")
+            if s["s_sc"] >= 10: dims.append(f"💤{s['sw_days']}d")
             if s["o_sc"] >= 10: dims.append(f"⚡OI{s['d6h']:+.0f}%")
             lines.append(
-                f"  {s['coin']:<7} {s['total']}分 | {' '.join(dims)}"
+                f"  {s['coin']:<7} {s['total']} pts | {' '.join(dims)}"
             )
         
-        # 表3: 埋伏
-        lines.append(f"\n🎯 **埋伏** (市值35+OI30+横盘20+费率15)")
+        # Table 3: ambush
+        lines.append(f"\n🎯 **Ambush** (Market Cap 35 + OI 30 + Sideways 20 + Funding 15)")
         for s in ambush[:8]:
             tags = [f"~{mcap_str(s['est_mcap'])}"]
             if abs(s["d6h"]) >= 2: tags.append(f"OI{s['d6h']:+.0f}%")
-            if s["d6h"] > 2 and abs(s["px_chg"]) < 5: tags.append("🎯暗流")
-            if s["sw_days"] >= 45: tags.append(f"横盘{s['sw_days']}天")
-            if s["fr_pct"] < -0.01: tags.append(f"费率{s['fr_pct']:.2f}%")
+            if s["d6h"] > 2 and abs(s["px_chg"]) < 5: tags.append("🎯Underflow")
+            if s["sw_days"] >= 45: tags.append(f"Sideways {s['sw_days']}d")
+            if s["fr_pct"] < -0.01: tags.append(f"Funding {s['fr_pct']:.2f}%")
             lines.append(
-                f"  {s['coin']:<7} {s['total']}分 | {' '.join(tags)}"
+                f"  {s['coin']:<7} {s['total']} pts | {' '.join(tags)}"
             )
         
-        # ═══ 值得关注提醒 ═══
+        # Worth-watching highlights
         highlights = []
         
-        # 热度+收筹池重叠 = 最强信号（放最前面！热度领先OI）
+        # Heat + pool overlap = strongest early signal
         hot_pool = [d for d in coin_data.values() if d["heat"] > 0 and d["in_pool"]]
         for s in sorted(hot_pool, key=lambda x: x["heat"], reverse=True)[:2]:
             tags = []
-            if s["in_cg"]: tags.append("CG热搜")
-            if s["vol_surge"]: tags.append("放量")
-            highlights.append(f"🔥💤 {s['coin']} 热度({'+'.join(tags)})+收筹{s['sw_days']}天=OI将涨")
+            if s["in_cg"]: tags.append("CG Trending")
+            if s["vol_surge"]: tags.append("Volume Surge")
+            highlights.append(f"🔥💤 {s['coin']} heat ({'+'.join(tags)}) + {s['sw_days']}d in accumulation = OI may follow")
         
-        # 热度+OI已经在涨 = 正在发生
+        # Heat + OI already rising = move is underway
         hot_oi = [d for d in coin_data.values() if d["heat"] > 0 and d["d6h"] > 5]
         for s in sorted(hot_oi, key=lambda x: x["d6h"], reverse=True)[:2]:
             if s["coin"] not in " ".join(highlights):
-                highlights.append(f"🔥⚡ {s['coin']} 热度+OI{s['d6h']:+.0f}%双涨！")
+                highlights.append(f"🔥⚡ {s['coin']} heat + OI{s['d6h']:+.0f}% are rising together!")
         
-        # 追多里费率加速恶化的前2
-        chase_fire = [s for s in chase[:5] if "加速" in s.get("trend", "")]
+        # Top two momentum names with accelerating funding deterioration
+        chase_fire = [s for s in chase[:5] if "Accelerating" in s.get("trend", "")]
         for s in chase_fire[:2]:
-            highlights.append(f"🔥 {s['coin']} 费率{s['fr_pct']:.3f}%加速恶化，空头涌入中")
+            highlights.append(f"🔥 {s['coin']} funding {s['fr_pct']:.3f}% is deteriorating faster, shorts keep flooding in")
         
-        # 三个表都出现的币
+        # Coins appearing across multiple tables
         chase_coins = set(s["coin"] for s in chase[:10])
         combined_coins = set(s["coin"] for s in combined[:10])
         ambush_coins = set(s["coin"] for s in ambush[:10])
         
-        # 追多+综合都出现
+        # Shared between momentum chase and combined
         overlap_2 = chase_coins & combined_coins
         if overlap_2:
             for c in list(overlap_2)[:2]:
-                highlights.append(f"⭐ {c} 追多+综合双榜上榜")
+                highlights.append(f"⭐ {c} appears in both Momentum Chase and Combined")
         
-        # 埋伏里OI暗流涌动的
+        # Ambush names showing underflow
         ambush_dark = [s for s in ambush[:10] if s["d6h"] > 2 and abs(s["px_chg"]) < 5]
         for s in ambush_dark[:2]:
-            highlights.append(f"🎯 {s['coin']} 暗流！OI{s['d6h']:+.0f}%但价格没动，市值仅{mcap_str(s['est_mcap'])}")
+            highlights.append(f"🎯 {s['coin']} underflow! OI{s['d6h']:+.0f}% while price is flat, market cap only {mcap_str(s['est_mcap'])}")
         
-        # 埋伏里市值极低+OI异动的
+        # Ambush names with very low market cap + OI anomaly
         ambush_gem = [s for s in ambush[:10] if s["est_mcap"] < 100e6 and abs(s["d6h"]) >= 3]
         for s in ambush_gem[:2]:
             if s["coin"] not in [h.split(" ")[1] for h in highlights]:
-                highlights.append(f"💎 {s['coin']} 低市值{mcap_str(s['est_mcap'])}+OI{s['d6h']:+.0f}%，埋伏首选")
+                highlights.append(f"💎 {s['coin']} low market cap {mcap_str(s['est_mcap'])} + OI{s['d6h']:+.0f}% makes it a top ambush candidate")
         
         if highlights:
-            lines.append(f"\n💡 **值得关注**")
+            lines.append(f"\n💡 **Worth Watching**")
             for h in highlights[:7]:
                 lines.append(f"  {h}")
         
-        # 图例说明
-        lines.append(f"\n📖 **图例**")
-        lines.append("  🔥热度=CG热搜+成交量暴增(OI领先指标)")
-        lines.append("  费率负=空头燃料 | 💎市值 | 💤横盘(收筹)")
-        lines.append("  🔥💤热度+收筹=最强预判 | 🔥⚡热度+OI=正在发生")
+        # Legend
+        lines.append(f"\n📖 **Legend**")
+        lines.append("  🔥Heat = CG trending + volume surge (leading OI indicator)")
+        lines.append("  Negative funding = short fuel | 💎 Market cap | 💤 Sideways accumulation")
+        lines.append("  🔥💤 Heat + accumulation = strongest early setup | 🔥⚡ Heat + OI = move underway")
         
         report = "\n".join(lines)
         send_telegram(report)
     
     conn.close()
-    print("\n✅ 完成")
+    print("\n✅ Done")
 
 
 if __name__ == "__main__":
