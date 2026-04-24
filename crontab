@@ -1,2 +1,2 @@
-0 10 * * * python3 /app/accumulation_radar.py pool >> /data/logs/accumulation.log 2>&1
+0 0 * * * python3 /app/accumulation_radar.py pool >> /data/logs/accumulation.log 2>&1
 30 * * * * python3 /app/accumulation_radar.py oi >> /data/logs/accumulation_oi.log 2>&1

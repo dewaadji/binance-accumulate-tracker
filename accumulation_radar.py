@@ -53,6 +53,7 @@ MIN_OI_USD = 2_000_000        # Minimum OI threshold: $2M
 # Volume breakout parameter
 VOL_BREAKOUT_MULT = 3.0       # Daily volume > 3x average = breakout
 BLOCKED_ALERT_SENT = False
+LAST_API_FAILURES = {}
 
 
 def notify_data_blocked(reason=""):
@@ -62,7 +63,21 @@ def notify_data_blocked(reason=""):
         return
     BLOCKED_ALERT_SENT = True
 
-    msg = "Data gagal didapat, blocked starlink/provider"
+    r = (reason or "").lower()
+    looks_blocked = any(
+        s in r
+        for s in (
+            "http 403",
+            "http 418",
+            "http 451",
+            "forbidden",
+            "blocked",
+            "connection reset",
+        )
+    )
+    msg = "Data gagal didapat dari API"
+    if looks_blocked:
+        msg = "Data gagal didapat, kemungkinan diblokir ISP/provider"
     if reason:
         msg = f"{msg}\nReason: {reason}"
     send_telegram(msg)
@@ -75,17 +90,26 @@ def api_get(endpoint, params=None):
         try:
             resp = requests.get(url, params=params, timeout=10)
             if resp.status_code == 200:
+                if endpoint in LAST_API_FAILURES:
+                    del LAST_API_FAILURES[endpoint]
                 return resp.json()
             elif resp.status_code in (403, 418, 451):
+                body = (resp.text or "").strip().replace("\n", " ")[:220]
+                LAST_API_FAILURES[endpoint] = f"HTTP {resp.status_code} {body}".strip()
                 notify_data_blocked(f"HTTP {resp.status_code} from {endpoint}")
                 return None
             elif resp.status_code == 429:
+                body = (resp.text or "").strip().replace("\n", " ")[:220]
+                LAST_API_FAILURES[endpoint] = f"HTTP 429 {body}".strip()
                 time.sleep(2)
             else:
+                body = (resp.text or "").strip().replace("\n", " ")[:220]
+                LAST_API_FAILURES[endpoint] = f"HTTP {resp.status_code} {body}".strip()
                 return None
         except requests.exceptions.RequestException as e:
             # Connection-level errors often indicate ISP/provider-level blocking.
             err = str(e).lower()
+            LAST_API_FAILURES[endpoint] = str(e)
             if "forbidden" in err or "blocked" in err or "connection reset" in err:
                 notify_data_blocked(f"request error on {endpoint}: {e}")
             time.sleep(1)
@@ -672,10 +696,21 @@ def main():
         # 1. Fetch market-wide funding + ticker data
         tickers_raw = api_get("/fapi/v1/ticker/24hr")
         premiums_raw = api_get("/fapi/v1/premiumIndex")
-        
+
         if not tickers_raw or not premiums_raw:
-            print("❌ API request failed")
-            notify_data_blocked("ticker/premium endpoints returned empty data")
+            print("❌ API request failed, retry in 60s...")
+            time.sleep(60)
+            tickers_raw = tickers_raw or api_get("/fapi/v1/ticker/24hr")
+            premiums_raw = premiums_raw or api_get("/fapi/v1/premiumIndex")
+
+        if not tickers_raw or not premiums_raw:
+            print("❌ API request failed after retry")
+            parts = []
+            if not tickers_raw:
+                parts.append(f"ticker failed: {LAST_API_FAILURES.get('/fapi/v1/ticker/24hr', 'unknown')}")
+            if not premiums_raw:
+                parts.append(f"premium failed: {LAST_API_FAILURES.get('/fapi/v1/premiumIndex', 'unknown')}")
+            notify_data_blocked(" | ".join(parts) if parts else "ticker/premium endpoints returned empty data")
             conn.close()
             return
         
