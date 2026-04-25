@@ -417,7 +417,7 @@ def build_pool_report(results, top_n=25):
     
     lines = [
         f"🏦 **Accumulation Radar** - Pool Update",
-        f"⏰ {now.strftime('%Y-%m-%d %H:%M')} CST",
+        f"⏰ {now.strftime('%Y-%m-%d %H:%M')} WIB",
         f"━━━━━━━━━━━━━━━━━━",
         f"Scanned {len(results)} contracts. Candidates found:",
         "",
@@ -439,7 +439,7 @@ def build_pool_report(results, top_n=25):
             lines.append(
                 f"     ${r['current_price']:.6f} | "
                 f"Range: ${r['low_price']:.6f}~${r['high_price']:.6f} | "
-                f"Avg daily volume: {format_usd(r['avg_vol'])}"
+                f"Avg d-vol: {format_usd(r['avg_vol'])}"
             )
         lines.append("")
     
@@ -459,7 +459,7 @@ def build_pool_report(results, top_n=25):
             lines.append(
                 f"  💤 {r['coin']} | Score:{r['score']:.0f} | "
                 f"Sideways {r['sideways_days']}d | Range {r['range_pct']:.0f}% | "
-                f"Avg daily volume {format_usd(r['avg_vol'])}"
+                f"Avg d-vol: {format_usd(r['avg_vol'])}"
             )
     
     return "\n".join(lines)
@@ -478,7 +478,7 @@ def build_oi_alert_report(alerts, watchlist_coins):
     
     lines = [
         f"📊 **OI Anomaly Scan** [Accumulation Pool]",
-        f"⏰ {now.strftime('%Y-%m-%d %H:%M')} CST",
+        f"⏰ {now.strftime('%Y-%m-%d %H:%M')} WIB",
         f"━━━━━━━━━━━━━━━━━━",
         "",
     ]
@@ -1010,7 +1010,7 @@ def main():
             for s in hot_coins[:8]:
                 tags = []
                 if s["in_cg"]: tags.append("🌐CG Trending")
-                if s["vol_surge"]: tags.append("📈Volume Surge")
+                if s["vol_surge"]: tags.append("📈Vol Surge")
                 oi_tag = f"OI{s['d6h']:+.0f}%" if abs(s["d6h"]) >= 3 else ""
                 if oi_tag: tags.append(f"⚡{oi_tag}")
                 if s["in_pool"]: tags.append(f"💤Pool {s['sw_days']}d")
