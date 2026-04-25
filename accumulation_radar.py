@@ -775,7 +775,7 @@ def main():
                         if ratio >= 2.5:  # Volume expanded by at least 2.5x
                             vol_surge_coins.add(coin)
                             heat_map[coin] = heat_map.get(coin, 0) + min(ratio * 10, 50)  # Cap at 50 points
-                    import time; time.sleep(0.05)
+                    time.sleep(0.05)
         
         print(f"📈 Volume surges (>=2.5x): {len(vol_surge_coins)} coins")
         # Double heat
@@ -813,7 +813,7 @@ def main():
                 circ_supply = float(oi_hist[-1].get("CMCCirculatingSupply", 0))
                 oi_map[sym] = {"oi_usd": curr, "d1h": d1h, "d6h": d6h, "circ_supply": circ_supply}
             if (i+1) % 10 == 0:
-                import time; time.sleep(0.5)
+                time.sleep(0.5)
         
         # 5. Score the three strategies independently
         
@@ -873,7 +873,7 @@ def main():
                 
                 chase.append({**d, "fr_delta": fr_delta, "trend": trend,
                               "rates": " → ".join([f"{x:.3f}" for x in fr_rates[-3:]])})
-                import time; time.sleep(0.2)
+                time.sleep(0.2)
         
         # Sort purely by funding rate, most negative first
         chase.sort(key=lambda x: x["fr_pct"])
