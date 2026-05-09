@@ -528,6 +528,37 @@ def build_oi_alert_report(alerts, watchlist_coins):
     return "\n".join(lines)
 
 
+def send_telegram_plain(text):
+    """Send a Telegram message as plain text (no Markdown parsing)."""
+    if not TG_BOT_TOKEN:
+        print("\n[TG] No token, stdout:\n")
+        print(text)
+        return
+
+    url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
+    chunks = []
+    current = ""
+    for line in text.split("\n"):
+        if len(current) + len(line) + 1 > 3800:
+            chunks.append(current)
+            current = line
+        else:
+            current += "\n" + line if current else line
+    if current:
+        chunks.append(current)
+
+    for chunk in chunks:
+        try:
+            resp = requests.post(url, json={
+                "chat_id": TG_CHAT_ID,
+                "text": chunk,
+            }, timeout=10)
+            print(f"[TG] Sent plain {'✓' if resp.status_code == 200 else '✗'} ({len(chunk)} chars)")
+        except Exception as e:
+            print(f"[TG] Error: {e}")
+        time.sleep(0.5)
+
+
 def send_telegram(text):
     """Send a Telegram message."""
     if not TG_BOT_TOKEN:
@@ -1026,26 +1057,47 @@ def check_telegram_commands(conn):
             params["offset"] = LAST_TG_UPDATE_ID + 1
 
         url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates"
-        resp = requests.get(url, params=params, timeout=5)
+        resp = requests.get(url, params=params, timeout=10)
         if resp.status_code != 200:
+            print(f"[TG] getUpdates returned HTTP {resp.status_code}: {(resp.text or '')[:200]}")
             return
 
-        updates = resp.json().get("result", [])
+        data = resp.json()
+        if not data.get("ok"):
+            print(f"[TG] getUpdates not ok: {data}")
+            return
+
+        updates = data.get("result", [])
+        print(f"[TG] getUpdates: {len(updates)} pending updates")
+
         for update in updates:
-            msg = update.get("message", {})
+            if "message" not in update:
+                # Non-message update (edited_message, callback_query, etc.) — skip but track ID
+                LAST_TG_UPDATE_ID = update["update_id"]
+                continue
+
+            msg = update["message"]
             text = msg.get("text", "").strip()
             chat_id = str(msg.get("chat", {}).get("id", ""))
 
             if chat_id != TG_CHAT_ID:
+                LAST_TG_UPDATE_ID = update["update_id"]
                 continue
 
             if text == "/review":
                 print("[TG] /review received, generating report...")
-                report_text = generate_review_report(conn)
-                send_telegram(report_text)
-                print("[TG] Review report sent")
+                try:
+                    report_text = generate_review_report(conn)
+                    send_telegram_plain(report_text)
+                    print("[TG] Review report sent")
+                except Exception as e:
+                    print(f"[TG] Review generation failed: {e}")
+                    send_telegram_plain("Error generating review report. Check logs.")
 
-            LAST_TG_UPDATE_ID = update["update_id"]
+                LAST_TG_UPDATE_ID = update["update_id"]
+            else:
+                LAST_TG_UPDATE_ID = update["update_id"]
+
     except Exception as e:
         print(f"[TG] Command check error: {e}")
 
@@ -1069,27 +1121,46 @@ def listen_commands():
             resp = requests.get(url, params=params, timeout=35)
 
             if resp.status_code != 200:
-                time.sleep(2)
+                print(f"[TG] getUpdates HTTP {resp.status_code}")
+                time.sleep(5)
                 continue
 
-            updates = resp.json().get("result", [])
+            data = resp.json()
+            if not data.get("ok"):
+                print(f"[TG] getUpdates not ok: {data}")
+                time.sleep(5)
+                continue
+
+            updates = data.get("result", [])
+            if updates:
+                print(f"[TG] Received {len(updates)} update(s)")
+
             for update in updates:
-                msg = update.get("message", {})
+                if "message" not in update:
+                    LAST_TG_UPDATE_ID = update["update_id"]
+                    continue
+
+                msg = update["message"]
                 text = msg.get("text", "").strip()
                 chat_id = str(msg.get("chat", {}).get("id", ""))
 
                 if chat_id != TG_CHAT_ID:
+                    LAST_TG_UPDATE_ID = update["update_id"]
                     continue
 
                 if text == "/review":
                     print("[TG] /review received")
-                    conn = init_db()
-                    report_text = generate_review_report(conn)
-                    send_telegram(report_text)
-                    conn.close()
-                    print("[TG] Review report sent")
+                    try:
+                        conn = init_db()
+                        report_text = generate_review_report(conn)
+                        send_telegram_plain(report_text)
+                        conn.close()
+                        print("[TG] Review report sent")
+                    except Exception as e:
+                        print(f"[TG] Review error: {e}")
+                        send_telegram_plain(f"Error: {e}")
                 elif text == "/help":
-                    send_telegram("Commands:\n/review - Signal tracker performance report")
+                    send_telegram_plain("Commands:\n/review - Signal tracker performance report")
 
                 LAST_TG_UPDATE_ID = update["update_id"]
         except Exception as e:
