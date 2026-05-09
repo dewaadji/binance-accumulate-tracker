@@ -163,8 +163,24 @@ def init_db():
         score REAL,
         notes TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS app_state (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )""")
     conn.commit()
     return conn
+
+
+def get_app_state(conn, key, default=None):
+    c = conn.cursor()
+    row = c.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def set_app_state(conn, key, value):
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO app_state(key, value) VALUES(?, ?)", (key, str(value)))
+    conn.commit()
 
 
 def get_all_perp_symbols():
@@ -1052,6 +1068,14 @@ def check_telegram_commands(conn):
         return
 
     try:
+        stored = get_app_state(conn, "last_tg_update_id", "0")
+        try:
+            stored_id = int(stored or 0)
+        except Exception:
+            stored_id = 0
+        if stored_id > LAST_TG_UPDATE_ID:
+            LAST_TG_UPDATE_ID = stored_id
+
         params = {"timeout": 2}
         if LAST_TG_UPDATE_ID > 0:
             params["offset"] = LAST_TG_UPDATE_ID + 1
@@ -1070,9 +1094,9 @@ def check_telegram_commands(conn):
         updates = data.get("result", [])
         print(f"[TG] getUpdates: {len(updates)} pending updates")
 
+        review_sent = False
         for update in updates:
             if "message" not in update:
-                # Non-message update (edited_message, callback_query, etc.) — skip but track ID
                 LAST_TG_UPDATE_ID = update["update_id"]
                 continue
 
@@ -1085,19 +1109,22 @@ def check_telegram_commands(conn):
                 continue
 
             if text == "/review":
-                print("[TG] /review received, generating report...")
-                try:
-                    report_text = generate_review_report(conn)
-                    send_telegram_plain(report_text)
-                    print("[TG] Review report sent")
-                except Exception as e:
-                    print(f"[TG] Review generation failed: {e}")
-                    send_telegram_plain("Error generating review report. Check logs.")
-
+                if not review_sent:
+                    print("[TG] /review received, generating report...")
+                    try:
+                        report_text = generate_review_report(conn)
+                        send_telegram_plain(report_text)
+                        print("[TG] Review report sent")
+                    except Exception as e:
+                        print(f"[TG] Review generation failed: {e}")
+                        send_telegram_plain("Error generating review report. Check logs.")
+                    review_sent = True
                 LAST_TG_UPDATE_ID = update["update_id"]
             else:
                 LAST_TG_UPDATE_ID = update["update_id"]
 
+        if LAST_TG_UPDATE_ID > stored_id:
+            set_app_state(conn, "last_tg_update_id", str(LAST_TG_UPDATE_ID))
     except Exception as e:
         print(f"[TG] Command check error: {e}")
 
