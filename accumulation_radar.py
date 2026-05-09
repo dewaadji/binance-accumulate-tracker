@@ -145,6 +145,24 @@ def init_db():
         vol_ratio REAL,
         details TEXT
     )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS signal_tracker (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        coin TEXT,
+        signal_type TEXT,
+        signal_time TEXT,
+        signal_price REAL,
+        range_high REAL,
+        range_low REAL,
+        entry_price REAL,
+        entry_time TEXT,
+        status TEXT DEFAULT 'pending',
+        outcome_price REAL,
+        outcome_time TEXT,
+        pnl_pct REAL,
+        score REAL,
+        notes TEXT
+    )""")
     conn.commit()
     return conn
 
@@ -635,7 +653,7 @@ def build_fuel_report(fuel_targets, squeeze_targets):
     now = datetime.now(timezone(timedelta(hours=8)))
     lines = [
         f"🔥 **Short Fuel Scan**",
-        f"⏰ {now.strftime('%Y-%m-%d %H:%M')} CST",
+        f"⏰ {now.strftime('%Y-%m-%d %H:%M')} WIB",
         f"━━━━━━━━━━━━━━━━━━",
         f"Logic: negative funding = lots of shorts, which can fuel squeezes and generate funding income",
         "",
@@ -662,6 +680,429 @@ def build_fuel_report(fuel_targets, squeeze_targets):
             )
     
     return "\n".join(lines)
+
+
+def save_signals(conn, chase, combined, ambush, reversal, coin_data, pool_map, now_str):
+    """Save top signals from each strategy to signal_tracker for performance tracking."""
+    c = conn.cursor()
+    to_save = []
+    seen = set()
+
+    cutoff = (datetime.now(timezone(timedelta(hours=8))) - timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
+    c.execute("SELECT coin, signal_type FROM signal_tracker WHERE signal_time > ?", (cutoff,))
+    for row in c.fetchall():
+        seen.add((row[0], row[1]))
+
+    def add_sig(coin, symbol, sig_type, price, score_val, rh=0, rl=0, n=""):
+        key = (coin, sig_type)
+        if key not in seen:
+            to_save.append((symbol, coin, sig_type, now_str, price, rh, rl, score_val, n))
+            seen.add(key)
+
+    for s in chase[:5]:
+        price = s.get("price", 0)
+        pool = pool_map.get(s["sym"], {})
+        add_sig(s["coin"], s["sym"], "momentum_chase", price, abs(s["fr_pct"]) * 10000,
+                rh=pool.get("high_price", 0), rl=pool.get("low_price", 0),
+                n=f"Funding {s['fr_pct']:.3f}% {s.get('trend','')}")
+
+    for s in combined[:5]:
+        price = s.get("price", 0)
+        pool = pool_map.get(s["sym"], {})
+        add_sig(s["coin"], s["sym"], "combined", price, s["total"],
+                rh=pool.get("high_price", 0), rl=pool.get("low_price", 0),
+                n=f"F{s['f_sc']} M{s['m_sc']} S{s['s_sc']} O{s['o_sc']}")
+
+    for s in ambush[:5]:
+        price = s.get("price", 0)
+        pool = pool_map.get(s["sym"], {})
+        sig_type = "underflow" if (s["d6h"] > 2 and abs(s["px_chg"]) < 5) else "ambush"
+        add_sig(s["coin"], s["sym"], sig_type, price, s["total"],
+                rh=pool.get("high_price", 0), rl=pool.get("low_price", 0),
+                n=f"OI{s['d6h']:+.0f}% MCap {format_usd(s['est_mcap'])} Sw{s['sw_days']}d")
+
+    for s in reversal[:5]:
+        price = s.get("price", 0)
+        pool = pool_map.get(s["sym"], {})
+        add_sig(s["coin"], s["sym"], "reversal", price, s["rev_score"],
+                rh=pool.get("high_price", 0), rl=pool.get("low_price", 0),
+                n=f"OI{s['d6h']:+.0f}% Px{s['px_chg']:+.0f}% {' '.join(s['rev_tags'][:3])}")
+
+    hot_coins = sorted([d for d in coin_data.values() if d["heat"] > 0], key=lambda x: x["heat"], reverse=True)
+    for s in hot_coins[:5]:
+        price = s.get("price", 0)
+        pool = pool_map.get(s["sym"], {})
+        n_parts = []
+        if s["in_cg"]: n_parts.append("CG")
+        if s["vol_surge"]: n_parts.append("Vol")
+        add_sig(s["coin"], s["sym"], "heat", price, s["heat"],
+                rh=pool.get("high_price", 0), rl=pool.get("low_price", 0),
+                n="+".join(n_parts) if n_parts else "")
+
+    for item in to_save:
+        c.execute("""INSERT INTO signal_tracker
+            (symbol, coin, signal_type, signal_time, signal_price, range_high, range_low, score, notes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", item)
+
+    conn.commit()
+    if to_save:
+        print(f"  📝 Tracked {len(to_save)} new signals")
+
+
+def check_breakouts(conn, ticker_map):
+    """Check pending signals for breakout confirmation or expiry."""
+    c = conn.cursor()
+    now = datetime.now(timezone(timedelta(hours=8)))
+    now_str = now.strftime("%Y-%m-%d %H:%M")
+    cutoff_30d = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
+
+    c.execute("""SELECT id, symbol, coin, signal_type, signal_time, signal_price,
+                 range_high, range_low, status FROM signal_tracker
+                 WHERE status = 'pending'""")
+
+    updated = 0
+    for row in c.fetchall():
+        sig_id, symbol, coin, sig_type, sig_time, sig_price, rh, rl, status = row
+
+        # Reversal signals are short setups — don't use range_high breakout for entry
+        if sig_type == "reversal":
+            if sig_time < cutoff_30d:
+                c.execute("UPDATE signal_tracker SET status='expired', outcome_time=? WHERE id=?", (now_str, sig_id))
+                updated += 1
+            continue
+
+        if sig_time < cutoff_30d:
+            c.execute("UPDATE signal_tracker SET status='expired', outcome_time=? WHERE id=?", (now_str, sig_id))
+            updated += 1
+            continue
+
+        if rh <= 0:
+            continue
+
+        tk = ticker_map.get(symbol, {})
+        current_price = tk.get("price", 0) if isinstance(tk, dict) else 0
+        if current_price <= 0:
+            continue
+
+        if current_price > rh:
+            c.execute("""UPDATE signal_tracker SET status='entered', entry_price=?, entry_time=?
+                         WHERE id=?""", (current_price, now_str, sig_id))
+            updated += 1
+            print(f"    🎯 {coin} breakout confirmed! Signal {sig_price:.6f} -> entry {current_price:.6f}")
+
+    if updated:
+        conn.commit()
+        print(f"  ✅ Updated {updated} breakout signals")
+
+
+def build_tracking_recap(conn):
+    """Build a short performance recap for inclusion in Telegram reports."""
+    c = conn.cursor()
+
+    c.execute("SELECT status, COUNT(*) FROM signal_tracker GROUP BY status")
+    counts = {row[0]: row[1] for row in c.fetchall()}
+
+    pending = counts.get("pending", 0)
+    entered = counts.get("entered", 0)
+    expired = counts.get("expired", 0)
+
+    if pending + entered == 0:
+        return ""
+
+    lines = ["", "📊 **Signal Tracking Recap**",
+             f"  {pending} pending | {entered} entered | {expired} expired"]
+
+    c.execute("""SELECT coin, signal_type, signal_price, entry_price,
+                 (entry_price - signal_price) / signal_price * 100
+                 FROM signal_tracker WHERE status = 'entered' ORDER BY entry_time DESC""")
+    entered_signals = c.fetchall()
+
+    if entered_signals:
+        profits = [s[4] for s in entered_signals if s[4] is not None]
+        if profits:
+            winners = sum(1 for p in profits if p > 0)
+            avg_pnl = sum(profits) / len(profits)
+            lines.append(f"  In profit: {winners}/{len(profits)} | Avg +{avg_pnl:.1f}%")
+
+            best = max(entered_signals, key=lambda x: x[4] or -999)
+            worst = min(entered_signals, key=lambda x: x[4] or 999)
+            lines.append(f"  🔥 Best: {best[0]} +{best[4]:.1f}% | 🔴 Worst: {worst[0]} {worst[4]:.1f}%")
+
+    c.execute("""SELECT signal_type, COUNT(*),
+                 SUM(CASE WHEN entry_price > signal_price THEN 1 ELSE 0 END)
+                 FROM signal_tracker WHERE status = 'entered' GROUP BY signal_type""")
+    for row in c.fetchall():
+        sig_type, total, wins = row
+        if total > 0:
+            rate = wins / total * 100
+            emoji = "🎯" if sig_type == "underflow" else "🔥" if sig_type == "momentum_chase" else "📊" if sig_type == "combined" else "🔻" if sig_type == "reversal" else "🌟"
+            lines.append(f"  {emoji} {sig_type}: {wins}/{total} ({rate:.0f}%)")
+
+    return "\n".join(lines)
+
+
+def score_reversal(coin_data, pool_map, conn):
+    """Score coins for short/reversal setups. Returns sorted list."""
+    c = conn.cursor()
+    reversal = []
+
+    for sym, d in coin_data.items():
+        score = 0
+        tags = []
+        rh = d.get("range_high", 0)
+        rl = d.get("range_low", 0)
+        price = d.get("price", 0)
+
+        # 1. Aggressive Short Build: OI rising + price falling (40 pts max)
+        if d["d6h"] > 5 and d["px_chg"] < -3:
+            score += 40
+            tags.append("ShortBuild")
+        elif d["d6h"] > 3 and d["px_chg"] < -1:
+            score += 30
+            tags.append("ShortBuild")
+        elif d["d6h"] > 1 and d["px_chg"] < 0:
+            score += 15
+            tags.append("ShortBuild")
+
+        # 2. Long Squeeze Fuel: funding extremely positive + price stalled (25 pts max)
+        if d["fr_pct"] > 0.1 and abs(d["px_chg"]) < 3:
+            score += 25
+            tags.append(f"LongSqueeze")
+        elif d["fr_pct"] > 0.05 and abs(d["px_chg"]) < 5:
+            score += 15
+            tags.append(f"LongSqueeze")
+        elif d["fr_pct"] > 0.03 and d["px_chg"] <= 0:
+            score += 10
+
+        # 3. Range Distribution: price near/above accumulation range high (20 pts max)
+        if rh > 0 and price > 0:
+            if price > rh:
+                score += 20
+                tags.append("RangeDist")
+            elif price > rh * 0.95:
+                score += 10
+                tags.append("NearTop")
+
+        # 4. Range Breakdown: price below accumulation range low (15 pts max)
+        if rl > 0 and price > 0 and d["in_pool"]:
+            if price < rl:
+                score += 15
+                tags.append("BelowRange")
+            elif price < rl * 1.05:
+                score += 5
+
+        # 5. Failed Breakout bonus: was entered long, now below range high (+10 bonus)
+        if rh > 0 and price > 0 and price < rh:
+            c.execute("""SELECT COUNT(*) FROM signal_tracker
+                         WHERE coin=? AND signal_type != 'reversal'
+                         AND status='entered' AND entry_time > ?""",
+                      (d["coin"], (datetime.now(timezone(timedelta(hours=8))) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")))
+            if c.fetchone()[0] > 0:
+                score += 10
+                tags.append("FailedBreakout")
+
+        if score >= 15:
+            reversal.append({**d, "rev_score": score, "rev_tags": tags})
+
+    reversal.sort(key=lambda x: x["rev_score"], reverse=True)
+    return reversal
+
+
+def generate_review_report(conn):
+    """Generate a review report string (for CLI or Telegram)."""
+    c = conn.cursor()
+    now = datetime.now(timezone(timedelta(hours=8)))
+    now_str = now.strftime("%Y-%m-%d %H:%M")
+
+    tracked_syms = set()
+    c.execute("SELECT DISTINCT symbol FROM signal_tracker")
+    for row in c.fetchall():
+        tracked_syms.add(row[0])
+
+    price_map = {}
+    for sym in tracked_syms:
+        tk = api_get("/fapi/v1/ticker/24hr", {"symbol": sym})
+        if tk:
+            price_map[sym] = float(tk["lastPrice"])
+        time.sleep(0.1)
+
+    # Update pending -> entered or expired
+    for sig_id, sym, sig_type, rh in c.execute("SELECT id, symbol, signal_type, range_high FROM signal_tracker WHERE status='pending'").fetchall():
+        sig_time_row = c.execute("SELECT signal_time FROM signal_tracker WHERE id=?", (sig_id,)).fetchone()
+        if sig_time_row:
+            cutoff = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
+            if sig_time_row[0] < cutoff:
+                c.execute("UPDATE signal_tracker SET status='expired', outcome_time=? WHERE id=?", (now_str, sig_id))
+            elif sig_type == "reversal":
+                continue  # Reversal signals don't enter on range_high breakout
+            elif rh > 0 and price_map.get(sym, 0) > rh:
+                c.execute("UPDATE signal_tracker SET status='entered', entry_price=?, entry_time=? WHERE id=?",
+                         (price_map[sym], now_str, sig_id))
+    conn.commit()
+
+    lines = [
+        f"Signal Tracker Review",
+        f"{now.strftime('%Y-%m-%d %H:%M')} WIB",
+        "",
+    ]
+
+    c.execute("""SELECT signal_type, COUNT(*),
+                 SUM(CASE WHEN status='entered' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END)
+                 FROM signal_tracker GROUP BY signal_type""")
+
+    for row in c.fetchall():
+        sig_type, total, entered_count, expired_count, pending_count = row
+        c.execute("""SELECT AVG((entry_price - signal_price) / signal_price * 100)
+                     FROM signal_tracker WHERE signal_type=? AND status='entered'""", (sig_type,))
+        avg_pnl = c.fetchone()[0]
+
+        win_count = c.execute("""SELECT COUNT(*) FROM signal_tracker
+                                 WHERE signal_type=? AND status='entered' AND entry_price > signal_price""",
+                              (sig_type,)).fetchone()[0]
+
+        wr = (win_count / entered_count * 100) if entered_count > 0 else 0
+        pnl_str = f"avg +{avg_pnl:.1f}%" if avg_pnl and avg_pnl > 0 else f"avg {avg_pnl:.1f}%" if avg_pnl else "N/A"
+        lines.append(f"  {sig_type}: {total} total | {entered_count} entered | {pending_count} pending | {expired_count} expired")
+        lines.append(f"    Win rate: {win_count}/{entered_count} ({wr:.0f}%) | {pnl_str}")
+
+    lines.append("")
+    lines.append("Recent Entered (last 7 days):")
+    cutoff_7d = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
+    c.execute("""SELECT coin, symbol, signal_type, entry_price, entry_time
+                 FROM signal_tracker WHERE status='entered' AND entry_time > ?
+                 ORDER BY entry_time DESC LIMIT 15""", (cutoff_7d,))
+
+    for row in c.fetchall():
+        coin, sym, sig_type, entry_price, entry_time = row
+        current_price = price_map.get(sym, entry_price)
+        current_pnl = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
+        # Reversal signals are short: price down = win
+        if sig_type == "reversal":
+            pnl_emoji = "+" if current_pnl < 0 else "-"
+        else:
+            pnl_emoji = "+" if current_pnl > 0 else "-"
+        lines.append(f"  {pnl_emoji} {coin:<8} {sig_type:<18} | Ent: {entry_price:.6f} Now: {current_price:.6f} ({current_pnl:+.1f}%)")
+
+    lines.append("")
+    lines.append("Pending (waiting for breakout):")
+    c.execute("""SELECT coin, signal_type, signal_price, range_high
+                 FROM signal_tracker WHERE status='pending' ORDER BY signal_time DESC LIMIT 10""")
+
+    for row in c.fetchall():
+        coin, sig_type, sig_price, rh = row
+        dist = ((rh - sig_price) / sig_price * 100) if rh > 0 and sig_price > 0 else 0
+        dist_str = f"need +{dist:.1f}%" if dist > 0 else "no range"
+        lines.append(f"  {coin:<8} {sig_type:<18} | Price: {sig_price:.6f} | {dist_str}")
+
+    total_signals = c.execute("SELECT COUNT(*) FROM signal_tracker").fetchone()[0]
+    total_entered = c.execute("SELECT COUNT(*) FROM signal_tracker WHERE status='entered'").fetchone()[0]
+    total_wins = c.execute("SELECT COUNT(*) FROM signal_tracker WHERE status='entered' AND entry_price > signal_price").fetchone()[0]
+    overall_wr = (total_wins / total_entered * 100) if total_entered > 0 else 0
+    c.execute("SELECT AVG((entry_price - signal_price) / signal_price * 100) FROM signal_tracker WHERE status='entered'")
+    overall_avg = c.fetchone()[0]
+
+    lines.append("")
+    lines.append(f"Overall: {total_signals} signals | {total_entered} entered | {total_wins} wins | {overall_wr:.0f}% win rate")
+    if overall_avg:
+        lines.append(f"Avg entry P&L: {overall_avg:+.1f}%")
+
+    return "\n".join(lines)
+
+
+LAST_TG_UPDATE_ID = 0
+
+
+def check_telegram_commands(conn):
+    """Check Telegram for pending /review commands (passive, called after oi scan)."""
+    global LAST_TG_UPDATE_ID
+    if not TG_BOT_TOKEN:
+        return
+
+    try:
+        params = {"timeout": 2}
+        if LAST_TG_UPDATE_ID > 0:
+            params["offset"] = LAST_TG_UPDATE_ID + 1
+
+        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates"
+        resp = requests.get(url, params=params, timeout=5)
+        if resp.status_code != 200:
+            return
+
+        updates = resp.json().get("result", [])
+        for update in updates:
+            msg = update.get("message", {})
+            text = msg.get("text", "").strip()
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+
+            if chat_id != TG_CHAT_ID:
+                continue
+
+            if text == "/review":
+                print("[TG] /review received, generating report...")
+                report_text = generate_review_report(conn)
+                send_telegram(report_text)
+                print("[TG] Review report sent")
+
+            LAST_TG_UPDATE_ID = update["update_id"]
+    except Exception as e:
+        print(f"[TG] Command check error: {e}")
+
+
+def listen_commands():
+    """Poll Telegram indefinitely for /review commands."""
+    global LAST_TG_UPDATE_ID
+    if not TG_BOT_TOKEN:
+        print("No Telegram bot token configured")
+        return
+
+    print("Listening for Telegram commands (/review)...")
+
+    while True:
+        try:
+            params = {"timeout": 30}
+            if LAST_TG_UPDATE_ID > 0:
+                params["offset"] = LAST_TG_UPDATE_ID + 1
+
+            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates"
+            resp = requests.get(url, params=params, timeout=35)
+
+            if resp.status_code != 200:
+                time.sleep(2)
+                continue
+
+            updates = resp.json().get("result", [])
+            for update in updates:
+                msg = update.get("message", {})
+                text = msg.get("text", "").strip()
+                chat_id = str(msg.get("chat", {}).get("id", ""))
+
+                if chat_id != TG_CHAT_ID:
+                    continue
+
+                if text == "/review":
+                    print("[TG] /review received")
+                    conn = init_db()
+                    report_text = generate_review_report(conn)
+                    send_telegram(report_text)
+                    conn.close()
+                    print("[TG] Review report sent")
+                elif text == "/help":
+                    send_telegram("Commands:\n/review - Signal tracker performance report")
+
+                LAST_TG_UPDATE_ID = update["update_id"]
+        except Exception as e:
+            print(f"[TG] Poll error: {e}")
+            time.sleep(5)
+
+
+def review_signals(conn):
+    """Full performance review (CLI mode)."""
+    report = generate_review_report(conn)
+    print(report)
+    c = conn.cursor()
+    return c.execute("SELECT COUNT(*) FROM signal_tracker").fetchone()[0]
 
 
 def main():
@@ -787,10 +1228,10 @@ def main():
         
         # 3. Read accumulation data from the database
         c2 = conn.cursor()
-        c2.execute("SELECT symbol, score, sideways_days, range_pct, avg_vol, status FROM watchlist")
+        c2.execute("SELECT symbol, score, sideways_days, range_pct, avg_vol, status, low_price, high_price, current_price FROM watchlist")
         pool_map = {}
         for row in c2.fetchall():
-            pool_map[row[0]] = {"pool_score": row[1], "sideways_days": row[2], "range_pct": row[3], "avg_vol": row[4], "status": row[5]}
+            pool_map[row[0]] = {"pool_score": row[1], "sideways_days": row[2], "range_pct": row[3], "avg_vol": row[4], "status": row[5], "low_price": row[6], "high_price": row[7], "current_price": row[8]}
         
         # 4. Scan OI for volume-expanding pool members + top-100 by volume
         scan_syms = set()
@@ -849,12 +1290,15 @@ def main():
             coin_data[sym] = {
                 "coin": coin, "sym": sym,
                 "px_chg": tk["px_chg"], "vol": tk["vol"],
+                "price": tk["price"],
                 "fr_pct": fr_pct, "d6h": d6h,
                 "oi_usd": oi_usd, "est_mcap": est_mcap,
                 "sw_days": sw_days, "pool_sc": pool_sc,
                 "in_pool": bool(pool), "heat": heat,
                 "in_cg": coin in cg_trending,
                 "vol_surge": coin in vol_surge_coins,
+                "range_high": pool.get("high_price", 0) if pool else 0,
+                "range_low": pool.get("low_price", 0) if pool else 0,
             }
         
         # ═══════════════════════════════════════
@@ -985,7 +1429,13 @@ def main():
                           "m_sc": m_sc, "o_sc": o_sc, "s_sc": s_sc, "f_sc": f_sc})
         
         ambush.sort(key=lambda x: x["total"], reverse=True)
-        
+        reversal = score_reversal(coin_data, pool_map, conn)
+
+        # 5.5 Save signals to tracker and check pending breakouts
+        now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
+        save_signals(conn, chase, combined, ambush, reversal, coin_data, pool_map, now_str)
+        check_breakouts(conn, ticker_map)
+
         # ═══════════════════════════════════════
         # 6. Build notification + worth-watching highlights
         # ═══════════════════════════════════════
@@ -997,7 +1447,7 @@ def main():
         now = datetime.now(timezone(timedelta(hours=8)))
         lines = [
             f"🏦 **Smart Money Radar** - Three Strategies + Heat",
-            f"⏰ {now.strftime('%Y-%m-%d %H:%M')} CST",
+            f"⏰ {now.strftime('%Y-%m-%d %H:%M')} WIB",
         ]
         
         # Table 0: heat ranking (most important, put first)
@@ -1054,7 +1504,23 @@ def main():
             lines.append(
                 f"  {s['coin']:<7} {s['total']} pts | {' '.join(tags)}"
             )
-        
+
+        # Table 4: reversal watch (short setups)
+        lines.append(f"\n🔻 **Reversal Watch** (Short setup candidates)")
+        if reversal:
+            for s in reversal[:8]:
+                tag_str = " ".join(s["rev_tags"][:3])
+                extra = []
+                if s["fr_pct"] > 0.03:
+                    extra.append(f"Fnd+{s['fr_pct']:.2f}%")
+                extr_str = " ".join(extra)
+                lines.append(
+                    f"  {s['coin']:<7} {s['rev_score']} pts | OI{s['d6h']:+.0f}% Px{s['px_chg']:+.0f}%"
+                    f" | ~{mcap_str(s['est_mcap'])} | {tag_str} {extr_str}".strip()
+                )
+        else:
+            lines.append("  None yet (no strong short signals)")
+
         # Worth-watching highlights
         highlights = []
         
@@ -1081,12 +1547,25 @@ def main():
         chase_coins = set(s["coin"] for s in chase[:10])
         combined_coins = set(s["coin"] for s in combined[:10])
         ambush_coins = set(s["coin"] for s in ambush[:10])
-        
+        reversal_coins = set(s["coin"] for s in reversal[:10])
+
         # Shared between momentum chase and combined
         overlap_2 = chase_coins & combined_coins
         if overlap_2:
             for c in list(overlap_2)[:2]:
                 highlights.append(f"⭐ {c} appears in both Momentum Chase and Combined")
+
+        # Reversal coins also in combined/ambush = conflicting signals = interesting
+        rev_in_combined = reversal_coins & combined_coins
+        if rev_in_combined:
+            for c in list(rev_in_combined)[:1]:
+                highlights.append(f"⚠️ {c} in both Reversal + Combined = conflicting signal, watch closely")
+
+        # Reversal coins also in the pool (was accumulation, now reversing)
+        rev_in_pool = [s for s in reversal[:10] if s["in_pool"]]
+        for s in rev_in_pool[:1]:
+            if s["coin"] not in [h.split(" ")[1] for h in highlights]:
+                highlights.append(f"🔻 {s['coin']} in accumulation pool but showing short signal = thesis may be broken")
         
         # Ambush names showing underflow
         ambush_dark = [s for s in ambush[:10] if s["d6h"] > 2 and abs(s["px_chg"]) < 5]
@@ -1098,21 +1577,76 @@ def main():
         for s in ambush_gem[:2]:
             if s["coin"] not in [h.split(" ")[1] for h in highlights]:
                 highlights.append(f"💎 {s['coin']} low market cap {mcap_str(s['est_mcap'])} + OI{s['d6h']:+.0f}% makes it a top ambush candidate")
-        
+
+        # Short/reversal highlights
+        rev_short_build = [s for s in reversal[:10] if s["d6h"] > 3 and s["px_chg"] < -2]
+        for s in rev_short_build[:2]:
+            highlights.append(f"🔻 {s['coin']} aggressive short build! OI{s['d6h']:+.0f}% + price {s['px_chg']:+.0f}%")
+
+        rev_squeeze = [s for s in reversal[:10] if s["fr_pct"] > 0.05 and abs(s["px_chg"]) < 3]
+        for s in rev_squeeze[:1]:
+            highlights.append(f"🔻 {s['coin']} funding +{s['fr_pct']:.2f}% stalled = long squeeze fuel")
+
+        rev_failed = [s for s in reversal[:10] if any("FailedBreakout" in t for t in s.get("rev_tags", []))]
+        for s in rev_failed[:1]:
+            highlights.append(f"🔻 {s['coin']} failed breakout: price fell back below range high")
+
+        rev_below = [s for s in reversal[:10] if s.get("in_pool") and s.get("range_low", 0) > 0 and s.get("price", 0) < s.get("range_low", 0)]
+        for s in rev_below[:1]:
+            highlights.append(f"🔻 {s['coin']} below accumulation range low = structure broken")
+
         if highlights:
             lines.append(f"\n💡 **Worth Watching**")
-            for h in highlights[:7]:
+            for h in highlights[:10]:
                 lines.append(f"  {h}")
         
-        # Legend
-        lines.append(f"\n📖 **Legend**")
-        lines.append("  🔥Heat = CG trending + volume surge (leading OI indicator)")
-        lines.append("  Negative funding = short fuel | 💎 Market cap | 💤 Sideways accumulation")
-        lines.append("  🔥💤 Heat + accumulation = strongest early setup | 🔥⚡ Heat + OI = move underway")
-        
+        # What To Do guide (actionable, not just emoji legend)
+        lines.append(f"\n📖 **How To Trade These Signals**")
+        lines.append("")
+        lines.append("  🎯 **Underflow** (OI↑ Price flat) — Highest priority")
+        lines.append("     → Alert at range high, enter on VOLUME-CONFIRMED breakout (>3x)")
+        lines.append("     → Stop: below range low | Target: 2-3x range width")
+        lines.append("  🔥 **Momentum Chase** (neg funding + price moving)")
+        lines.append("     → Wait for pullback, don't chase green candles")
+        lines.append("     → Stop: -5% | Exit: funding flips above -0.01%")
+        lines.append("  💤 **Ambush / Pool Only** (accumulating, no move yet)")
+        lines.append("     → Not actionable yet -- add to Binance watchlist")
+        lines.append("     → Wait for: OI spike OR volume breakout OR funding flip")
+        lines.append("")
+        lines.append("  📊 **OI-Price Matrix**:")
+        lines.append("     OI↑ Price↑ = trend | OI↑ Price→ = 🎯underflow | OI↑ Price↓ = shorts | OI↓ Price↑ = squeeze")
+        lines.append("")
+        lines.append("  🔻 **Reversal Watch** (Short setups)")
+        lines.append("     → Best signal: OI rising + price falling = whales building shorts")
+        lines.append("     → Enter after first lower low, stop above recent swing high")
+        lines.append("     → Target: 1-2x sideways range downward")
+        lines.append("     → Failed breakout: short when price closes back below range high")
+
         report = "\n".join(lines)
-        send_telegram(report)
+
+        # Append signal tracking recap if there are tracked signals
+        tracking_recap = build_tracking_recap(conn)
+        if tracking_recap:
+            report += "\n" + tracking_recap
+            if len(report) < 3500:
+                send_telegram(report)
+            else:
+                send_telegram(report)
+        else:
+            send_telegram(report)
+        check_telegram_commands(conn)
     
+    if mode == "review":
+        review_signals(conn)
+        print("\n✅ Review complete")
+        conn.close()
+        return
+
+    if mode == "listen":
+        conn.close()
+        listen_commands()
+        return
+
     conn.close()
     print("\n✅ Done")
 

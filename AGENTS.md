@@ -1,0 +1,153 @@
+# AGENTS.md — Accumulation Radar
+
+## Project Overview
+
+A fully automated, zero-cost crypto market scanner that detects "smart money" accumulation signals across Binance perpetual futures. Single-file Python application (~1121 lines).
+
+**Core hypothesis**: Smart money accumulates before markup moves → long sideways + low volume = accumulation; OI spikes = large capital entering; both signals overlapping = strongest setup.
+
+## Tech Stack
+
+- **Language**: Python 3.8+
+- **Single dependency**: `requests` (no `requirements.txt`)
+- **Database**: SQLite3 (`accumulation.db`)
+- **APIs**: Binance Futures REST (free, no keys), Binance Spot marketing API, CoinGecko trending
+- **Notifications**: Telegram Bot API
+- **Containerization**: Docker + Docker Compose (multi-arch: `amd64`, `arm64`)
+
+## Directory Structure
+
+```
+.
+├── accumulation_radar.py   # Entire application (single file)
+├── accumulate.db           # SQLite database (gitignored)
+├── README.md               # Documentation
+├── Dockerfile              # Multi-arch build, supercronic scheduler
+├── docker-compose.yml
+├── docker-entrypoint.sh    # Runs pool scan then starts supercronic
+├── crontab                 # pool at 00:00 UTC, oi at :30 hourly
+├── .env.example            # Template for TG_BOT_TOKEN, TG_CHAT_ID
+├── .env.oi                 # Actual env file (gitignored)
+├── .gitignore
+├── .dockerignore
+├── LICENSE                 # MIT
+```
+
+No `requirements.txt`, no test suite, no lint config, no CI/CD.
+
+## Operations
+
+### Three Strategies (generated hourly via `oi` mode)
+
+| # | Name | Description |
+|---|------|-------------|
+| 1 | Momentum Chase | Funding-rate ranking for short-term squeezes |
+| 2 | Combined | Four balanced dimensions: Funding + Market cap + Sideways days + OI change |
+| 3 | Ambush | Early-positioning strategy for mid/long-term |
+
+### Two Modes
+
+| Mode | When | Purpose |
+|------|------|---------|
+| `pool` | Daily | Full market scan (~400+ perps) → find accumulation candidates → save to SQLite |
+| `oi` | Hourly | Fetch funding/ticker/OI data → score three strategies → send Telegram report |
+
+### Running Locally
+
+```bash
+pip install requests
+cp .env.example .env.oi   # edit with TG_BOT_TOKEN, TG_CHAT_ID
+python3 accumulation_radar.py pool   # daily scan
+python3 accumulation_radar.py oi     # hourly scan
+python3 accumulation_radar.py full   # both
+```
+
+### Running with Docker
+
+```bash
+docker compose up -d --build
+```
+
+Container runs `docker-entrypoint.sh`: one-time pool scan → supercronic starts (pool at 00:00 UTC, oi at :30 hourly). Logs at `./data/logs/`.
+
+## Testing & Linting
+
+**No test suite, no linting configured.** Testing is manual — run the script and check Telegram output. When making changes, verify by running:
+
+```bash
+python3 accumulation_radar.py oi   # quickest path to validate changes
+```
+
+## Key Architecture & Conventions
+
+### Data Flow
+
+1. **Pool scan** (`pool`): Fetch all USDT perpetuals → download 180 daily candles each → analyze for accumulation (sideways range, volume, slope, market cap) → score → save to `watchlist` table → Telegram report.
+2. **OI scan** (`oi`): Load watchlist from DB → fetch 24h tickers + funding rates → fetch OI history for pool + top-100 volume → real market caps from Binance Spot → CoinGecko trending → score three strategies → Telegram report.
+
+### Database Schema (SQLite)
+
+- **`watchlist`**: `symbol` (PK), `coin`, `added_date`, `sideways_days`, `range_pct`, `avg_vol`, `low_price`, `high_price`, `current_price`, `score`, `status` (watching/removed/breakout), `last_oi_alert`, `notes`
+- **`alerts`**: `id` (PK autoincrement), `symbol`, `alert_type`, `alert_time`, `price`, `oi_delta_pct`, `vol_ratio`, `details`
+
+### Market Cap Fallback Chain
+
+1. Binance Spot marketing API (real circulating market cap)
+2. Binance Futures OI endpoint (`CMCCirculatingSupply * price`)
+3. Rough estimate (`24h_volume * 0.3` or `open_interest * 2`)
+
+### Key Detection Parameters
+
+| Parameter | Value |
+|-----------|-------|
+| `MIN_SIDEWAYS_DAYS` | 45 |
+| `MAX_RANGE_PCT` | 80% |
+| `MAX_AVG_VOL_USD` | $20M |
+| `MIN_DATA_DAYS` | 50 |
+| `MIN_OI_DELTA_PCT` | 3.0% |
+| `MIN_OI_USD` | $2M |
+| `VOL_BREAKOUT_MULT` | 3.0x |
+
+### Exclusions
+
+- Stablecoins: USDC, USDP, TUSD, FDUSD
+- Index products: BTCDOM, DEFI, USDM
+- Already exploded: coins up >300% from prior average
+
+### Error Handling
+
+- API retries up to 3x with backoff
+- HTTP 403/418/451 → one-time "data blocked" Telegram alert
+- HTTP 429 → 2s sleep + retry
+- CoinGecko and market-cap failures are non-fatal (falls back to estimates)
+
+### Naming & Style
+
+- `snake_case` variables
+- Timezone: WIB/CST (UTC+8) for display
+- Symbol display: `BTCUSDT` → strip `USDT` → `BTC`
+- Emoji-based status indicators throughout reports
+
+## Docker Notes
+
+- Non-root user `app` (UID 10001)
+- `supercronic` instead of traditional cron (container-compatible)
+- `DB_PATH` overridden to `/data/accumulation.db`
+- Logs at `/data/logs/`
+- `.env.oi` expected in container for Telegram credentials
+
+## Common Commands Reference
+
+```bash
+# Run pool scan
+python3 accumulation_radar.py pool
+
+# Run hourly OI scan
+python3 accumulation_radar.py oi
+
+# Docker build and start
+docker compose up -d --build
+
+# View container logs
+docker compose logs -f
+```
