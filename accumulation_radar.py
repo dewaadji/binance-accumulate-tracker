@@ -39,6 +39,7 @@ TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 FAPI = "https://fapi.binance.com"
 _default_db_path = Path(__file__).parent / "accumulation.db"
 DB_PATH = Path(os.getenv("DB_PATH", str(_default_db_path)))
+TG_POLL_COMMANDS_IN_OI = os.getenv("TG_POLL_COMMANDS_IN_OI", "1").strip() == "1"
 
 # Accumulation pool parameters
 MIN_SIDEWAYS_DAYS = 45        # At least 45 sideways days
@@ -1136,6 +1137,15 @@ def listen_commands():
         print("No Telegram bot token configured")
         return
 
+    conn = init_db()
+    stored = get_app_state(conn, "last_tg_update_id", "0")
+    try:
+        stored_id = int(stored or 0)
+    except Exception:
+        stored_id = 0
+    if stored_id > LAST_TG_UPDATE_ID:
+        LAST_TG_UPDATE_ID = stored_id
+
     print("Listening for Telegram commands (/review)...")
 
     while True:
@@ -1178,10 +1188,8 @@ def listen_commands():
                 if text == "/review":
                     print("[TG] /review received")
                     try:
-                        conn = init_db()
                         report_text = generate_review_report(conn)
                         send_telegram_plain(report_text)
-                        conn.close()
                         print("[TG] Review report sent")
                     except Exception as e:
                         print(f"[TG] Review error: {e}")
@@ -1190,6 +1198,9 @@ def listen_commands():
                     send_telegram_plain("Commands:\n/review - Signal tracker performance report")
 
                 LAST_TG_UPDATE_ID = update["update_id"]
+                if LAST_TG_UPDATE_ID > stored_id:
+                    set_app_state(conn, "last_tg_update_id", str(LAST_TG_UPDATE_ID))
+                    stored_id = LAST_TG_UPDATE_ID
         except Exception as e:
             print(f"[TG] Poll error: {e}")
             time.sleep(5)
@@ -1732,7 +1743,8 @@ def main():
                 send_telegram(report)
         else:
             send_telegram(report)
-        check_telegram_commands(conn)
+        if TG_POLL_COMMANDS_IN_OI:
+            check_telegram_commands(conn)
     
     if mode == "review":
         review_signals(conn)

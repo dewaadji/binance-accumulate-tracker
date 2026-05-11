@@ -7,5 +7,18 @@ services:
       - .env.oi
     environment:
       DB_PATH: /data/accumulation.db
+      TG_POLL_COMMANDS_IN_OI: "0"
     volumes:
       - ./data:/data
+
+  acc-track-listener:
+    build:
+      context: .
+    restart: unless-stopped
+    env_file:
+      - .env.oi
+    environment:
+      DB_PATH: /data/accumulation.db
+    volumes:
+      - ./data:/data
+    entrypoint: ["python3", "/app/accumulation_radar.py", "listen"]
