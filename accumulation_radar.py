@@ -949,7 +949,7 @@ def score_reversal(coin_data, pool_map, conn):
                 score += 10
                 tags.append("FailedBreakout")
 
-        if score >= 15:
+        if score >= 35:
             reversal.append({**d, "rev_score": score, "rev_tags": tags})
 
     reversal.sort(key=lambda x: x["rev_score"], reverse=True)
@@ -1475,7 +1475,7 @@ def main():
             else: o_sc = 0
             
             total = f_sc + m_sc + s_sc + o_sc
-            if total < 25: continue
+            if total < 75: continue
             
             combined.append({**d, "total": total,
                             "f_sc": f_sc, "m_sc": m_sc, "s_sc": s_sc, "o_sc": o_sc})
@@ -1532,7 +1532,7 @@ def main():
             else: f_sc = 0
             
             total = m_sc + o_sc + s_sc + f_sc
-            if total < 20: continue
+            if total < 75: continue
             
             ambush.append({**d, "total": total,
                           "m_sc": m_sc, "o_sc": o_sc, "s_sc": s_sc, "f_sc": f_sc})
