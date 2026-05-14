@@ -2,6 +2,7 @@
 set -eu
 
 mkdir -p /data/logs
+mkdir -p /data/journal
 
 echo "[startup] running one-time pool scan..."
 if python3 /app/accumulation_radar.py pool >> /data/logs/accumulation.log 2>&1; then

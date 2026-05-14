@@ -56,6 +56,35 @@ VOL_BREAKOUT_MULT = 3.0       # Daily volume > 3x average = breakout
 BLOCKED_ALERT_SENT = False
 LAST_API_FAILURES = {}
 
+# Journal config
+JOURNAL_DIR = Path(__file__).parent / "data" / "journal"
+
+
+def ensure_journal_dir():
+    """Ensure journal directory exists."""
+    JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_journal(month_str):
+    """Load journal JSON for a given month (YYYY-MM)."""
+    ensure_journal_dir()
+    path = JOURNAL_DIR / f"{month_str}.json"
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {"month": month_str, "btc_briefs": [], "trades": []}
+    return {"month": month_str, "btc_briefs": [], "trades": []}
+
+
+def save_journal(month_str, data):
+    """Save journal JSON for a given month."""
+    ensure_journal_dir()
+    path = JOURNAL_DIR / f"{month_str}.json"
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+
 
 def notify_data_blocked(reason=""):
     """Send a one-time alert when upstream market data appears to be blocked."""
@@ -1059,6 +1088,672 @@ def generate_review_report(conn):
     return "\n".join(lines)
 
 
+# ═══════════════════════════════════════════
+# Trade Journal — BTC brief, /limit, sync, /perps
+# ═══════════════════════════════════════════
+
+def compute_ema(values, period):
+    """Compute EMA for a list of values."""
+    if len(values) < period:
+        return None
+    k = 2.0 / (period + 1)
+    ema = sum(values[:period]) / period
+    for v in values[period:]:
+        ema = v * k + ema * (1 - k)
+    return ema
+
+
+def compute_rsi(closes, period=14):
+    """Compute RSI from a list of closing prices."""
+    if len(closes) < period + 1:
+        return None
+    gains, losses = 0, 0
+    for i in range(1, period + 1):
+        diff = closes[i] - closes[i - 1]
+        if diff > 0:
+            gains += diff
+        else:
+            losses -= diff
+    avg_gain = gains / period
+    avg_loss = losses / period
+    if avg_loss == 0:
+        return 100
+    rs = avg_gain / avg_loss
+    for i in range(period + 1, len(closes)):
+        diff = closes[i] - closes[i - 1]
+        gain = diff if diff > 0 else 0
+        loss = -diff if diff < 0 else 0
+        avg_gain = (avg_gain * (period - 1) + gain) / period
+        avg_loss = (avg_loss * (period - 1) + loss) / period
+    rs = avg_gain / avg_loss if avg_loss > 0 else float("inf")
+    return 100 - (100 / (1 + rs))
+
+
+def generate_btc_brief():
+    """Generate BTC daily bias brief using multi-factor analysis."""
+    print("📊 Generating BTC daily brief...")
+
+    sym = "BTCUSDT"
+
+    # Fetch 90-day daily klines
+    klines = api_get("/fapi/v1/klines", {"symbol": sym, "interval": "1d", "limit": 90})
+    if not klines or len(klines) < 60:
+        print("  ❌ Not enough BTC kline data")
+        return None
+
+    closes = [float(k[4]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    vols = [float(k[7]) for k in klines]
+    current_price = closes[-1]
+
+    # EMAs
+    ema21 = compute_ema(closes, 21)
+    ema55 = compute_ema(closes, 55)
+    ema200 = compute_ema(closes, 200) if len(closes) >= 200 else None
+
+    # RSI 14
+    rsi14 = compute_rsi(closes, 14)
+
+    # Support / Resistance from last 20 swing highs/lows
+    recent_highs = highs[-20:]
+    recent_lows = lows[-20:]
+    resistance = sorted(set(recent_highs), reverse=True)[:2]
+    support = sorted(set(recent_lows))[:2]
+
+    # Volume ratio (last 5 days vs 20-day avg)
+    vol_5d = sum(vols[-5:]) / 5 if len(vols) >= 5 else 0
+    vol_20d_avg = sum(vols[-21:-1]) / 20 if len(vols) >= 22 else vol_5d
+    volume_ratio = vol_5d / vol_20d_avg if vol_20d_avg > 0 else 1
+
+    # Funding rate
+    funding_raw = api_get("/fapi/v1/fundingRate", {"symbol": sym, "limit": 4})
+    funding_rate = 0
+    funding_trend = "neutral"
+    if funding_raw and len(funding_raw) >= 2:
+        funding_rate = float(funding_raw[-1]["fundingRate"])
+        prev_fr = float(funding_raw[-3]["fundingRate"]) if len(funding_raw) >= 3 else funding_rate
+        if funding_rate < prev_fr - 0.0001:
+            funding_trend = "negative"
+        elif funding_rate > prev_fr + 0.0001:
+            funding_trend = "positive"
+
+    # OI history (24h delta)
+    oi_hist = api_get("/futures/data/openInterestHist", {"symbol": sym, "period": "1h", "limit": 25})
+    oi_delta_pct = 0
+    if oi_hist and len(oi_hist) >= 24:
+        curr_oi = float(oi_hist[-1]["sumOpenInterestValue"])
+        prev_24h_oi = float(oi_hist[0]["sumOpenInterestValue"])
+        if prev_24h_oi > 0:
+            oi_delta_pct = ((curr_oi - prev_24h_oi) / prev_24h_oi) * 100
+
+    # === Bias determination (7 factors, each +1 / 0 / -1) ===
+    factors = 0
+    signals = []
+
+    # Factor 1: Price vs EMA21
+    if ema21:
+        if current_price > ema21 * 1.01:
+            factors += 1
+            signals.append(f"Price above EMA21 (${ema21:,.0f})")
+        elif current_price < ema21 * 0.99:
+            factors -= 1
+            signals.append(f"Price below EMA21 (${ema21:,.0f})")
+        else:
+            signals.append(f"Price near EMA21 (${ema21:,.0f})")
+
+    # Factor 2: EMA21 vs EMA55
+    if ema21 and ema55:
+        if ema21 > ema55 * 1.005:
+            factors += 1
+            signals.append(f"EMA21 > EMA55 (bullish alignment)")
+        elif ema21 < ema55 * 0.995:
+            factors -= 1
+            signals.append(f"EMA21 < EMA55 (bearish alignment)")
+        else:
+            signals.append(f"EMA21 ∼ EMA55 (neutral)")
+
+    # Factor 3: EMA55 vs EMA200
+    if ema55 and ema200:
+        if ema55 > ema200 * 1.01:
+            factors += 1
+            signals.append(f"EMA55 > EMA200 (long-term bullish)")
+        elif ema55 < ema200 * 0.99:
+            factors -= 1
+            signals.append(f"EMA55 < EMA200 (long-term bearish)")
+        else:
+            signals.append(f"EMA55 ∼ EMA200 (neutral)")
+
+    # Factor 4: RSI
+    if rsi14 is not None:
+        if rsi14 > 60:
+            factors += 1
+            signals.append(f"RSI {rsi14:.1f} (bullish momentum)")
+        elif rsi14 < 40:
+            factors -= 1
+            signals.append(f"RSI {rsi14:.1f} (bearish momentum)")
+        else:
+            signals.append(f"RSI {rsi14:.1f} (neutral zone)")
+
+    # Factor 5: Funding trend
+    if funding_trend == "negative":
+        factors -= 1
+        signals.append(f"Funding trend negative ({funding_rate:+.4%})")
+    elif funding_trend == "positive":
+        factors += 1
+        signals.append(f"Funding trend positive ({funding_rate:+.4%})")
+    else:
+        signals.append(f"Funding neutral ({funding_rate:+.4%})")
+
+    # Factor 6: OI direction
+    if oi_delta_pct > 2:
+        factors += 1
+        signals.append(f"OI rising {oi_delta_pct:+.1f}% (capital flowing in)")
+    elif oi_delta_pct < -2:
+        factors -= 1
+        signals.append(f"OI declining {oi_delta_pct:+.1f}% (capital exiting)")
+    else:
+        signals.append(f"OI flat {oi_delta_pct:+.1f}%")
+
+    # Factor 7: Volume
+    if volume_ratio > 1.3:
+        factors += 1
+        signals.append(f"Volume {volume_ratio:.1f}x avg (strong participation)")
+    elif volume_ratio < 0.7:
+        factors -= 1
+        signals.append(f"Volume {volume_ratio:.1f}x avg (low participation)")
+    else:
+        signals.append(f"Volume {volume_ratio:.1f}x avg (normal)")
+
+    # Bias & confidence
+    if factors >= 3:
+        bias = "bullish"
+    elif factors <= -3:
+        bias = "bearish"
+    else:
+        bias = "neutral"
+
+    abs_score = abs(factors)
+    if abs_score >= 5:
+        confidence = "high"
+    elif abs_score >= 3:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    # Summary
+    ema_status = "bullish alignment" if factors > 0 and ema21 and ema55 and ema21 > ema55 else \
+                 "bearish alignment" if factors < 0 and ema21 and ema55 and ema21 < ema55 else \
+                 "mixed/neutral alignment"
+    summary = f"BTC bias {bias.upper()}. Price ${current_price:,.0f}, {ema_status}, RSI {rsi14:.1f}, " \
+              f"funding {funding_rate:+.4%} ({funding_trend}), OI {oi_delta_pct:+.1f}%."
+
+    brief = {
+        "date": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d"),
+        "bias": bias,
+        "confidence": confidence,
+        "price": round(current_price, 2),
+        "ema21": round(ema21, 2) if ema21 else 0,
+        "ema55": round(ema55, 2) if ema55 else 0,
+        "ema200": round(ema200, 2) if ema200 else 0,
+        "rsi14": round(rsi14, 1) if rsi14 else 0,
+        "funding_rate": round(funding_rate, 6),
+        "funding_trend": funding_trend,
+        "oi_delta_pct": round(oi_delta_pct, 2),
+        "volume_ratio": round(volume_ratio, 2),
+        "support": round(support[0], 2) if support else 0,
+        "resistance": round(resistance[0], 2) if resistance else 0,
+        "signals": signals,
+        "summary": summary,
+    }
+
+    # Save to journal
+    now_wib = datetime.now(timezone(timedelta(hours=8)))
+    month_str = now_wib.strftime("%Y-%m")
+    journal = load_journal(month_str)
+    journal["btc_briefs"].append(brief)
+    save_journal(month_str, journal)
+
+    # Build Telegram message
+    emoji = "🟢" if bias == "bullish" else "🔴" if bias == "bearish" else "🟡"
+    conf_indicator = "◆◆◆" if confidence == "high" else "◆◆" if confidence == "medium" else "◆"
+    lines_brief = [
+        f"📊 **BTC Daily Brief** — {brief['date']} WIB",
+        f"",
+        f"{emoji} **{bias.upper()}** ({confidence} confidence {conf_indicator})",
+        f"Price: ${current_price:,.0f}",
+        f"",
+        f"📉 **Technicals**:",
+        f"EMA21 ${ema21:,.0f} | EMA55 ${ema55:,.0f}" + (f" | EMA200 ${ema200:,.0f}" if ema200 else ""),
+        f"RSI 14: {rsi14:.1f}",
+        f"Key support: ${brief['support']:,.0f} | Resistance: ${brief['resistance']:,.0f}",
+        f"",
+        f"💸 **Funding & OI**:",
+        f"Funding: {funding_rate:+.4%} ({funding_trend} trend)",
+        f"OI 24h: {oi_delta_pct:+.1f}%",
+        f"",
+        f"📊 Volume: {volume_ratio:.1f}x of 20d avg",
+        f"",
+        f"**Signals**:",
+    ]
+    for sig in signals:
+        lines_brief.append(f"  • {sig}")
+    lines_brief.append(f"")
+    lines_brief.append(f"**Summary**: {summary}")
+
+    full_brief = "\n".join(lines_brief)
+    send_telegram(full_brief)
+
+    print(f"  ✅ BTC brief saved: {bias.upper()} ({confidence})")
+    return brief
+
+
+def parse_limit_command(text):
+    """Parse /limit command and return trade dict or error string.
+    Format: /limit <direction> <symbol> <entry> invalid <price> sl <price> tp1 <price> [tp2...]"""
+    parts = text.strip().split()
+    if len(parts) < 8:
+        return "❌ Usage: /limit <long|short> <SYMBOL> <entry> invalid <price> sl <price> tp1 <price> [tp2 <price> ...]"
+
+    direction = parts[1].lower()
+    if direction not in ("long", "short"):
+        return f"❌ Invalid direction '{direction}'. Use 'long' or 'short'."
+
+    coin = parts[2].upper()
+    symbol = f"{coin}USDT"
+
+    try:
+        entry = float(parts[3])
+    except ValueError:
+        return f"❌ Invalid entry price: {parts[3]}"
+
+    # Parse keyword-value pairs
+    keywords = {}
+    i = 4
+    while i < len(parts):
+        kw = parts[i].lower()
+        if kw in ("invalid", "sl"):
+            if i + 1 >= len(parts):
+                return f"❌ Missing value for '{kw}'"
+            keywords[kw] = parts[i + 1]
+            i += 2
+        elif kw.startswith("tp"):
+            if i + 1 >= len(parts):
+                return f"❌ Missing value for '{kw}'"
+            keywords[kw] = parts[i + 1]
+            i += 2
+        else:
+            return f"❌ Unknown keyword: {kw}. Use: invalid, sl, tp1, tp2, ..."
+
+    # Validate required fields
+    if "invalid" not in keywords:
+        return "❌ Missing 'invalid' price."
+    if "sl" not in keywords:
+        return "❌ Missing 'sl' (stop loss) price."
+
+    try:
+        invalid_price = float(keywords["invalid"])
+        sl_price = float(keywords["sl"])
+    except ValueError:
+        return "❌ Invalid numeric value for invalid or sl."
+
+    # Parse TPs
+    targets = []
+    tp_keys = sorted([k for k in keywords if k.startswith("tp")], key=lambda x: int(x[2:]))
+    for k in tp_keys:
+        try:
+            targets.append(float(keywords[k]))
+        except ValueError:
+            return f"❌ Invalid price for {k}."
+
+    if not targets:
+        return "❌ At least one tp1 is required."
+
+    # Validate direction logic
+    if direction == "short":
+        if entry <= 0:
+            return "❌ Entry price must be positive."
+        if sl_price <= entry:
+            return f"❌ For SHORT: SL ({sl_price}) must be above entry ({entry})."
+        if invalid_price <= entry:
+            return f"❌ For SHORT: invalid ({invalid_price}) must be above entry ({entry})."
+        for tp in targets:
+            if tp >= entry:
+                return f"❌ For SHORT: TP ({tp}) must be below entry ({entry})."
+        # TPs should be sorted descending (closest to farthest)
+        if targets != sorted(targets, reverse=True):
+            return "❌ For SHORT: TP prices should be ordered from highest to lowest (tp1 closest to entry)."
+    else:  # long
+        if entry <= 0:
+            return "❌ Entry price must be positive."
+        if sl_price >= entry:
+            return f"❌ For LONG: SL ({sl_price}) must be below entry ({entry})."
+        if invalid_price >= entry:
+            return f"❌ For LONG: invalid ({invalid_price}) must be below entry ({entry})."
+        for tp in targets:
+            if tp <= entry:
+                return f"❌ For LONG: TP ({tp}) must be above entry ({entry})."
+        # TPs should be sorted ascending (closest to farthest)
+        if targets != sorted(targets):
+            return "❌ For LONG: TP prices should be ordered from lowest to highest (tp1 closest to entry)."
+
+    # Calculate risk
+    risk_r = abs(entry - sl_price)
+
+    trade = {
+        "id": "",
+        "created_at": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00"),
+        "direction": direction,
+        "symbol": symbol,
+        "coin": coin,
+        "entry": entry,
+        "invalid": invalid_price,
+        "sl": sl_price,
+        "targets": targets,
+        "status": "pending",
+        "risk_r": round(risk_r, 2),
+        "tp_status": [{"price": tp, "hit": False, "hit_at": None} for tp in targets],
+        "sl_hit": False,
+        "sl_hit_at": None,
+        "entry_filled": False,
+        "entry_filled_at": None,
+        "invalidated": False,
+        "invalidated_at": None,
+        "all_tps_hit": False,
+        "last_sync": None,
+        "notes": "",
+    }
+
+    # Generate ID
+    now_wib = datetime.now(timezone(timedelta(hours=8)))
+    trade["id"] = f"{now_wib.strftime('%m-%d')}-{coin}-{int(entry)}"
+
+    return trade
+
+
+def add_trade_to_journal(trade):
+    """Add a trade entry to the current month's journal."""
+    now_wib = datetime.now(timezone(timedelta(hours=8)))
+    month_str = now_wib.strftime("%Y-%m")
+    journal = load_journal(month_str)
+    journal["trades"].append(trade)
+    save_journal(month_str, journal)
+    return True
+
+
+def check_level_crossing(trade, klines):
+    """Check if price crossed any key levels using 1h candle data.
+    Returns updated trade dict and list of events."""
+    if not klines or len(klines) < 2:
+        return trade, []
+
+    direction = trade["direction"]
+    events = []
+
+    for k in klines:
+        high = float(k[2])
+        low = float(k[3])
+        kline_ts = k[0]
+
+        # For SHORT: entry/invalid/SL are ABOVE, TPs are BELOW
+        # Entry/SL/Invalid crossed when high >= level
+        # TP crossed when low <= level
+        if direction == "short":
+            cross_up = lambda level: high >= level
+            cross_down = lambda level: low <= level
+        else:
+            # For LONG: entry/invalid/SL are BELOW, TPs are ABOVE
+            # Entry/SL/Invalid crossed when low <= level
+            # TP crossed when high >= level
+            cross_up = lambda level: high >= level
+            cross_down = lambda level: low <= level
+
+        if direction == "short":
+            crosses_entry = cross_up(trade["entry"])
+            crosses_invalid = cross_up(trade["invalid"])
+            crosses_sl = cross_up(trade["sl"])
+        else:
+            crosses_entry = cross_down(trade["entry"])
+            crosses_invalid = cross_down(trade["invalid"])
+            crosses_sl = cross_down(trade["sl"])
+
+        # Priority: invalid > SL > entry > TPs
+        if not trade["invalidated"] and not trade["entry_filled"] and crosses_invalid:
+            trade["invalidated"] = True
+            trade["invalidated_at"] = datetime.fromtimestamp(kline_ts / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+            trade["status"] = "invalidated"
+            events.append(f"🚫 {trade['coin']} {trade['direction'].upper()}: Invalidated at {trade['invalid']}")
+            break
+
+        if not trade["entry_filled"] and crosses_entry:
+            trade["entry_filled"] = True
+            trade["entry_filled_at"] = datetime.fromtimestamp(kline_ts / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+            trade["status"] = "active"
+            events.append(f"✅ {trade['coin']} {trade['direction'].upper()}: Entry filled at {trade['entry']}")
+
+        if trade["entry_filled"] and not trade["sl_hit"] and crosses_sl:
+            trade["sl_hit"] = True
+            trade["sl_hit_at"] = datetime.fromtimestamp(kline_ts / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+            trade["status"] = "stopped_out"
+            events.append(f"💀 {trade['coin']} {trade['direction'].upper()}: Stopped out at {trade['sl']}")
+            break
+
+        if trade["entry_filled"]:
+            for i, tp in enumerate(trade["tp_status"]):
+                if not tp["hit"]:
+                    if direction == "short":
+                        hit = cross_down(tp["price"])
+                    else:
+                        hit = cross_up(tp["price"])
+                    if hit:
+                        tp["hit"] = True
+                        tp["hit_at"] = datetime.fromtimestamp(kline_ts / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+                        r_achieved = abs(tp["price"] - trade["entry"]) / trade["risk_r"] if trade["risk_r"] > 0 else 0
+                        events.append(f"🎯 {trade['coin']} TP{i+1} ({tp['price']}) hit — {r_achieved:.1f}R")
+
+            # Check if all TPs hit
+            if all(tp["hit"] for tp in trade["tp_status"]):
+                trade["all_tps_hit"] = True
+                trade["status"] = "completed"
+                break
+
+        # Update after each candle
+        trade["last_sync"] = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+
+    return trade, events
+
+
+def sync_trades():
+    """Sync all active trades with current price conditions (every 12h)."""
+    print("📊 Syncing trade journal...")
+
+    now_wib = datetime.now(timezone(timedelta(hours=8)))
+    month_str = now_wib.strftime("%Y-%m")
+    journal = load_journal(month_str)
+
+    if not journal.get("trades"):
+        print("  No trades to sync.")
+        return
+
+    all_events = []
+    updated_indices = []
+
+    for idx, trade in enumerate(journal["trades"]):
+        # Skip terminal trades
+        if trade["status"] in ("completed", "stopped_out", "invalidated"):
+            continue
+
+        sym = trade["symbol"]
+        # Fetch 1h klines for last 12 hours
+        klines = api_get("/fapi/v1/klines", {"symbol": sym, "interval": "1h", "limit": 13})
+        if not klines:
+            print(f"  ⚠️ No kline data for {sym}, skipping")
+            continue
+
+        updated_trade, events = check_level_crossing(trade, klines)
+        if events:
+            journal["trades"][idx] = updated_trade
+            updated_indices.append(idx)
+            all_events.extend(events)
+
+        time.sleep(0.1)
+
+    if updated_indices:
+        save_journal(month_str, journal)
+        print(f"  ✅ Updated {len(updated_indices)} trades: {len(all_events)} events")
+
+        # Send Telegram report
+        lines = [
+            f"📊 **Trade Sync Report** — {now_wib.strftime('%Y-%m-%d %H:%M')} WIB",
+            f"",
+        ]
+        for event in all_events:
+            lines.append(f"  {event}")
+
+        # Summary of active trades
+        active_trades = [t for t in journal["trades"] if t["status"] in ("pending", "active")]
+        if active_trades:
+            lines.append(f"")
+            lines.append(f"**Active Trades** ({len(active_trades)}):")
+            for t in active_trades:
+                tps_hit = sum(1 for tp in t["tp_status"] if tp["hit"])
+                tps_total = len(t["tp_status"])
+                lines.append(
+                    f"  {t['coin']} {t['direction'].upper()} | "
+                    f"Entry: {t['entry']} | SL: {t['sl']} | Status: {t['status']} | "
+                    f"TPs: {tps_hit}/{tps_total}"
+                )
+
+        send_telegram("\n".join(lines))
+    else:
+        print("  No trade status changes.")
+
+
+def generate_perps_stats(month_str=None):
+    """Generate monthly perps trade statistics."""
+    if month_str is None:
+        now_wib = datetime.now(timezone(timedelta(hours=8)))
+        month_str = now_wib.strftime("%Y-%m")
+
+    journal = load_journal(month_str)
+    trades = journal.get("trades", [])
+
+    if not trades:
+        return "📈 Perps Journal — {}\n\nNo trades recorded this month.".format(month_str)
+
+    total = len(trades)
+    status_counts = {}
+    for t in trades:
+        s = t.get("status", "pending")
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    # Resolved trades (completed or stopped_out, not pending/invalidated)
+    resolved = [t for t in trades if t.get("status") in ("completed", "stopped_out")]
+    winners = [t for t in resolved if t["status"] == "completed"]
+    losers = [t for t in resolved if t["status"] == "stopped_out"]
+
+    win_rate = (len(winners) / len(resolved) * 100) if resolved else 0
+
+    # Calculate R:R and ROI for resolved trades
+    rr_values = []
+    roi_values = []
+    for t in resolved:
+        if t.get("status") == "completed":
+            # Best TP hit
+            best_tp = None
+            for tp in t["tp_status"]:
+                if tp["hit"]:
+                    best_tp = tp["price"]
+            if best_tp and t.get("risk_r", 0) > 0:
+                if t.get("direction") == "short":
+                    r_val = (t["entry"] - best_tp) / t["risk_r"]
+                    roi = (t["entry"] - best_tp) / t["entry"] * 100
+                else:
+                    r_val = (best_tp - t["entry"]) / t["risk_r"]
+                    roi = (best_tp - t["entry"]) / t["entry"] * 100
+                rr_values.append(r_val)
+                roi_values.append(roi)
+        else:  # stopped_out
+            rr_values.append(-1.0)
+            if t.get("direction") == "short":
+                roi_values.append(-(t.get("sl", t.get("entry", 0) + 1) - t.get("entry", 0)) / t.get("entry", 1) * 100)
+            else:
+                roi_values.append(-(t.get("entry", 0) - t.get("sl", t.get("entry", 0) - 1)) / t.get("entry", 1) * 100)
+
+    avg_rr = sum(rr_values) / len(rr_values) if rr_values else 0
+    avg_roi = sum(roi_values) / len(roi_values) if roi_values else 0
+    best_rr = max(rr_values) if rr_values else 0
+    worst_rr = min(rr_values) if rr_values else 0
+
+    # Find best and worst trade names
+    best_trade = ""
+    worst_trade = ""
+    if rr_values:
+        best_idx = rr_values.index(best_rr)
+        worst_idx = rr_values.index(worst_rr)
+        bcoin = resolved[best_idx].get("coin", "??")
+        bdir = resolved[best_idx].get("direction", "??").upper()
+        best_trade = f"{bcoin} {bdir} +{best_rr:.1f}R (+{roi_values[best_idx]:.1f}%)"
+        wcoin = resolved[worst_idx].get("coin", "??")
+        wdir = resolved[worst_idx].get("direction", "??").upper()
+        worst_trade = f"{wcoin} {wdir} {worst_rr:.1f}R ({roi_values[worst_idx]:.1f}%)"
+
+    # Long vs Short breakdown
+    longs = [t for t in trades if t.get("direction") == "long"]
+    shorts = [t for t in trades if t.get("direction") == "short"]
+    long_w = sum(1 for t in longs if t.get("status") == "completed")
+    long_l = sum(1 for t in longs if t.get("status") == "stopped_out")
+    long_p = sum(1 for t in longs if t.get("status") == "pending")
+    long_a = sum(1 for t in longs if t.get("status") == "active")
+    long_i = sum(1 for t in longs if t.get("status") == "invalidated")
+    short_w = sum(1 for t in shorts if t.get("status") == "completed")
+    short_l = sum(1 for t in shorts if t.get("status") == "stopped_out")
+    short_p = sum(1 for t in shorts if t.get("status") == "pending")
+    short_a = sum(1 for t in shorts if t.get("status") == "active")
+    short_i = sum(1 for t in shorts if t.get("status") == "invalidated")
+
+    pending = status_counts.get("pending", 0)
+    active = status_counts.get("active", 0)
+    completed = status_counts.get("completed", 0)
+    stopped = status_counts.get("stopped_out", 0)
+    invalid = status_counts.get("invalidated", 0)
+
+    lines = [
+        f"📈 **Perps Journal** — {month_str}",
+        f"",
+        f"Trades: {total} | ✅ Complete: {completed} | ❌ Stopped: {stopped}",
+        f"⏳ Active: {active} | 🕐 Pending: {pending} | 🚫 Invalid: {invalid}",
+        f"",
+    ]
+    if resolved:
+        lines.append(f"Win Rate: {win_rate:.1f}% ({completed}/{len(resolved)} resolved)")
+        lines.append(f"Avg R:R: {avg_rr:+.1f}R | Avg ROI: {avg_roi:+.1f}%")
+        lines.append(f"")
+        lines.append(f"🏆 Best: {best_trade}")
+        lines.append(f"💀 Worst: {worst_trade}")
+        lines.append(f"")
+    if longs:
+        long_detail = f"{len(longs)} ({long_w}W/"
+        parts_l = []
+        if long_l: parts_l.append(f"{long_l}L")
+        if long_a: parts_l.append(f"{long_a}A")
+        if long_p: parts_l.append(f"{long_p}P")
+        if long_i: parts_l.append(f"{long_i}I")
+        long_detail += "/".join(parts_l) + ")"
+        lines.append(f"Long: {long_detail}")
+    if shorts:
+        short_detail = f"{len(shorts)} ({short_w}W/"
+        parts_s = []
+        if short_l: parts_s.append(f"{short_l}L")
+        if short_a: parts_s.append(f"{short_a}A")
+        if short_p: parts_s.append(f"{short_p}P")
+        if short_i: parts_s.append(f"{short_i}I")
+        short_detail += "/".join(parts_s) + ")"
+        lines.append(f"Short: {short_detail}")
+
+    return "\n".join(lines)
+
+
 LAST_TG_UPDATE_ID = 0
 
 
@@ -1109,7 +1804,42 @@ def check_telegram_commands(conn):
                 LAST_TG_UPDATE_ID = update["update_id"]
                 continue
 
-            if text == "/review":
+            if text.startswith("/limit"):
+                print(f"[TG] /limit received: {text[:80]}")
+                result = parse_limit_command(text)
+                if isinstance(result, str):
+                    # Error message
+                    send_telegram_plain(result)
+                    print(f"[TG] /limit error: {result[:80]}")
+                else:
+                    add_trade_to_journal(result)
+                    # Build confirmation
+                    direction_emoji = "🔴 SHORT" if result["direction"] == "short" else "🟢 LONG"
+                    tps_lines = []
+                    for i, tp in enumerate(result["tp_status"]):
+                        r_val = abs(tp["price"] - result["entry"]) / result["risk_r"] if result["risk_r"] > 0 else 0
+                        tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R)")
+                    reply = (
+                        f"✅ Trade saved: {direction_emoji} {result['coin']} @ {result['entry']}\n"
+                        f"SL: {result['sl']} | Invalid: {result['invalid']}\n"
+                        + "\n".join(tps_lines)
+                    )
+                    send_telegram_plain(reply)
+                    print(f"[TG] Trade saved: {result['id']}")
+                LAST_TG_UPDATE_ID = update["update_id"]
+            elif text == "/perps":
+                if not review_sent:
+                    print("[TG] /perps received, generating stats...")
+                    try:
+                        stats_text = generate_perps_stats()
+                        send_telegram_plain(stats_text)
+                        print("[TG] Perps stats sent")
+                    except Exception as e:
+                        print(f"[TG] Perps stats failed: {e}")
+                        send_telegram_plain("Error generating perps stats. Check logs.")
+                    review_sent = True
+                LAST_TG_UPDATE_ID = update["update_id"]
+            elif text == "/review":
                 if not review_sent:
                     print("[TG] /review received, generating report...")
                     try:
@@ -1185,7 +1915,36 @@ def listen_commands():
                     LAST_TG_UPDATE_ID = update["update_id"]
                     continue
 
-                if text == "/review":
+                if text.startswith("/limit"):
+                    print(f"[TG] /limit received: {text[:80]}")
+                    result = parse_limit_command(text)
+                    if isinstance(result, str):
+                        send_telegram_plain(result)
+                        print(f"[TG] /limit error: {result[:80]}")
+                    else:
+                        add_trade_to_journal(result)
+                        direction_emoji = "🔴 SHORT" if result["direction"] == "short" else "🟢 LONG"
+                        tps_lines = []
+                        for i, tp in enumerate(result["tp_status"]):
+                            r_val = abs(tp["price"] - result["entry"]) / result["risk_r"] if result["risk_r"] > 0 else 0
+                            tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R)")
+                        reply = (
+                            f"✅ Trade saved: {direction_emoji} {result['coin']} @ {result['entry']}\n"
+                            f"SL: {result['sl']} | Invalid: {result['invalid']}\n"
+                            + "\n".join(tps_lines)
+                        )
+                        send_telegram_plain(reply)
+                        print(f"[TG] Trade saved: {result['id']}")
+                elif text == "/perps":
+                    print("[TG] /perps received")
+                    try:
+                        stats_text = generate_perps_stats()
+                        send_telegram_plain(stats_text)
+                        print("[TG] Perps stats sent")
+                    except Exception as e:
+                        print(f"[TG] Perps stats error: {e}")
+                        send_telegram_plain(f"Error: {e}")
+                elif text == "/review":
                     print("[TG] /review received")
                     try:
                         report_text = generate_review_report(conn)
@@ -1195,7 +1954,7 @@ def listen_commands():
                         print(f"[TG] Review error: {e}")
                         send_telegram_plain(f"Error: {e}")
                 elif text == "/help":
-                    send_telegram_plain("Commands:\n/review - Signal tracker performance report")
+                    send_telegram_plain("Commands:\n/review - Signal tracker performance report\n/limit - Set trade limit (e.g. /limit short BTC 81000 invalid 81400 sl 81500 tp1 79000 tp2 78000)\n/perps - Monthly perps trade stats")
 
                 LAST_TG_UPDATE_ID = update["update_id"]
                 if LAST_TG_UPDATE_ID > stored_id:
@@ -1746,10 +2505,31 @@ def main():
         if TG_POLL_COMMANDS_IN_OI:
             check_telegram_commands(conn)
     
+    if mode == "btc":
+        conn.close()
+        generate_btc_brief()
+        print("\n✅ BTC brief complete")
+        return
+
+    if mode == "sync":
+        conn.close()
+        sync_trades()
+        print("\n✅ Trade sync complete")
+        return
+
     if mode == "review":
         review_signals(conn)
         print("\n✅ Review complete")
         conn.close()
+        return
+
+    if mode == "perps":
+        conn.close()
+        stats = generate_perps_stats()
+        if stats:
+            send_telegram_plain(stats)
+        print(stats)
+        print("\n✅ Perps stats complete")
         return
 
     if mode == "listen":

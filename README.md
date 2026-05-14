@@ -87,18 +87,36 @@ python3 accumulation_radar.py pool
 # Run once per hour: three strategy scores + OI anomaly monitoring
 python3 accumulation_radar.py oi
 
-# Run everything
+# BTC daily bias brief (multi-factor analysis)
+python3 accumulation_radar.py btc
+
+# Sync all active trades with current price conditions
+python3 accumulation_radar.py sync
+
+# Generate monthly perps trade statistics
+python3 accumulation_radar.py perps
+
+# Start Telegram command listener (handles /limit, /perps, /review, /help)
+python3 accumulation_radar.py listen
+
+# Run everything (pool + oi)
 python3 accumulation_radar.py full
 ```
 
 ### Recommended Crontab
 
 ```crontab
-# Update the accumulation pool every day at 10:00
-0 10 * * *  cd /path/to/accumulation-radar && python3 accumulation_radar.py pool >> accumulation.log 2>&1
+# Update the accumulation pool every day at 00:00 UTC
+0 0 * * *  cd /path/to/accumulation-radar && python3 accumulation_radar.py pool >> data/logs/accumulation.log 2>&1
+
+# BTC daily brief at 00:30 UTC (after pool scan)
+30 0 * * * cd /path/to/accumulation-radar && python3 accumulation_radar.py btc >> data/logs/accumulation_btc.log 2>&1
 
 # Scan OI anomalies + three strategy scores every hour at :30
-30 * * * *  cd /path/to/accumulation-radar && python3 accumulation_radar.py oi >> accumulation_oi.log 2>&1
+30 * * * *  cd /path/to/accumulation-radar && python3 accumulation_radar.py oi >> data/logs/accumulation_oi.log 2>&1
+
+# Sync trade journal every 12 hours
+0 */12 * * * cd /path/to/accumulation-radar && python3 accumulation_radar.py sync >> data/logs/accumulation_sync.log 2>&1
 ```
 
 ## Sample Notification
@@ -139,6 +157,89 @@ python3 accumulation_radar.py full
 | ↑ | Flat | ⚡ Underflow | **Best ambush setup** |
 | ↓ | ↑ | 💪 Squeeze | Shorts getting liquidated |
 | ↓ | ↓ | 💨 Exit wave | Longs stopping out |
+
+## Trade Journal
+
+A built-in trade journal for tracking limit trade setups. All data stored as JSON files under `data/journal/YYYY-MM.json`.
+
+### BTC Daily Brief (`btc` mode)
+
+Multi-factor BTC bias analysis that runs daily at 00:30 UTC. Uses 7 factors to determine bias:
+
+| Factor | Signal |
+|--------|--------|
+| EMA 21/55/200 alignment | Bullish/bearish/neutral alignment |
+| RSI 14 | Overbought/mid/oversold zone |
+| Funding rate trend | Positive/negative/neutral |
+| OI 24h delta | Capital flowing in/out |
+| Volume vs 20d avg | Conviction level |
+| Support/resistance | Nearest key levels from swing highs/lows |
+
+Result is saved to the journal and sent via Telegram with a confidence rating (High/Medium/Low).
+
+### Telegram Commands
+
+The app can long-poll Telegram for commands. Start the listener:
+
+```bash
+python3 accumulation_radar.py listen
+```
+
+Or enable passive command checking in `oi` mode by setting `TG_POLL_COMMANDS_IN_OI=1` in `.env.oi`.
+
+| Command | Description | Example |
+|---------|-------------|---------|
+| `/limit` | Add a new limit trade setup | `/limit short BTC 81000 invalid 81400 sl 81500 tp1 79000 tp2 78000 tp3 77000` |
+| `/perps` | Show current month perps trade statistics | `/perps` |
+| `/review` | Signal tracker performance report | `/review` |
+| `/help` | List available commands | `/help` |
+
+#### `/limit` Format
+
+```
+/limit <long|short> <SYMBOL> <entry> invalid <price> sl <price> tp1 <price> [tp2 <price> ...]
+```
+
+- **direction**: `long` or `short`
+- **symbol**: any USDT perpetual (e.g., `BTC`, `ETH`, `SOL`)
+- **entry**: limit order entry price
+- **invalid**: price level that invalidates the setup (before entry fills)
+- **sl**: stop loss price
+- **tp1, tp2, ...**: take profit levels (minimum 1, unlimited maximum)
+
+Example:
+```
+/limit short BTC 81000 invalid 81400 sl 81500 tp1 79000 tp2 78000 tp3 77000
+```
+
+#### `/perps` Output Example
+
+```
+📈 Perps Journal — 2026-05
+
+Trades: 15 | ✅ Complete: 6 | ❌ Stopped: 3
+⏳ Active: 2 | 🕐 Pending: 3 | 🚫 Invalid: 1
+
+Win Rate: 66.7% (6/9 resolved)
+Avg R:R: +2.4R | Avg ROI: +3.8%
+
+🏆 Best: BTC SHORT +6.0R (+7.4%)
+💀 Worst: ETH LONG -1.0R (-2.1%)
+
+Long: 6 (3W/2L/1A) | Short: 9 (3W/1L/1A/3P/1I)
+```
+
+### Trade Lifecycle
+
+Trades progress through these statuses:
+
+```
+pending → active (entry filled) → completed (all TPs hit)
+                               → stopped_out (SL hit)
+pending → invalidated (price hit invalid level before entry filled)
+```
+
+The `sync` cron (every 12 hours) checks 1h kline data for each active trade, detecting level crossings to update statuses automatically.
 
 ## Cost
 
