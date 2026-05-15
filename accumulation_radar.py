@@ -57,7 +57,10 @@ BLOCKED_ALERT_SENT = False
 LAST_API_FAILURES = {}
 
 # Journal config
-JOURNAL_DIR = Path(__file__).parent / "data" / "journal"
+_default_journal_dir = Path(__file__).parent / "data" / "journal"
+if DB_PATH.is_absolute() and str(DB_PATH).startswith("/data/"):
+    _default_journal_dir = DB_PATH.parent / "journal"
+JOURNAL_DIR = Path(os.getenv("JOURNAL_DIR", str(_default_journal_dir)))
 
 
 def ensure_journal_dir():
