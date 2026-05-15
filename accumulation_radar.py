@@ -2235,6 +2235,28 @@ def generate_perps_stats(month_str=None):
         short_detail += "/".join(parts_s) + ")"
         lines.append(f"Short: {short_detail}")
 
+    pending_limit_setups = [
+        t for t in trades
+        if t.get("status") == "pending"
+        and not t.get("entry_filled", False)
+        and t.get("invalid") is not None
+    ]
+    if pending_limit_setups:
+        lines.append(f"")
+        lines.append(f"**Pending /limit (deletable)** — {len(pending_limit_setups)}")
+        max_list = 30
+        for t in pending_limit_setups[:max_list]:
+            lev = int(t.get("lev", 1) or 1)
+            if lev <= 0:
+                lev = 1
+            lines.append(
+                f"  {t.get('coin','??')} {t.get('direction','??').upper()} | "
+                f"Entry {t.get('entry','?')} | Lev {lev}x | "
+                f"ID: {t.get('id','')}"
+            )
+        if len(pending_limit_setups) > max_list:
+            lines.append(f"  ... +{len(pending_limit_setups) - max_list} more")
+
     return "\n".join(lines)
 
 
