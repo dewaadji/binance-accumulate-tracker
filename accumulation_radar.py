@@ -62,6 +62,11 @@ if DB_PATH.is_absolute() and str(DB_PATH).startswith("/data/"):
     _default_journal_dir = DB_PATH.parent / "journal"
 JOURNAL_DIR = Path(os.getenv("JOURNAL_DIR", str(_default_journal_dir)))
 
+_default_spot_journal_dir = Path(__file__).parent / "data" / "spot_journal"
+if DB_PATH.is_absolute() and str(DB_PATH).startswith("/data/"):
+    _default_spot_journal_dir = DB_PATH.parent / "spot_journal"
+SPOT_JOURNAL_DIR = Path(os.getenv("SPOT_JOURNAL_DIR", str(_default_spot_journal_dir)))
+
 
 def ensure_journal_dir():
     """Ensure journal directory exists."""
@@ -85,6 +90,32 @@ def save_journal(month_str, data):
     """Save journal JSON for a given month."""
     ensure_journal_dir()
     path = JOURNAL_DIR / f"{month_str}.json"
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, default=str)
+
+
+def ensure_spot_journal_dir():
+    """Ensure spot journal directory exists."""
+    SPOT_JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_spot_journal(month_str):
+    """Load spot journal JSON for a given month (YYYY-MM)."""
+    ensure_spot_journal_dir()
+    path = SPOT_JOURNAL_DIR / f"{month_str}.json"
+    if path.exists():
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError):
+            return {"month": month_str, "trades": []}
+    return {"month": month_str, "trades": []}
+
+
+def save_spot_journal(month_str, data):
+    """Save spot journal JSON for a given month."""
+    ensure_spot_journal_dir()
+    path = SPOT_JOURNAL_DIR / f"{month_str}.json"
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
 
@@ -1398,10 +1429,10 @@ def get_btc_brief_today():
 
 def parse_limit_command(text):
     """Parse /limit command and return trade dict or error string.
-    Format: /limit <direction> <symbol> <entry> invalid <price> sl <price> tp1 <price> [tp2...]"""
+    Format: /limit <direction> <symbol> <entry> lev <x> invalid <price> sl <price> tp1 <price> [tp2...]"""
     parts = text.strip().split()
-    if len(parts) < 8:
-        return "❌ Usage: /limit <long|short> <SYMBOL> <entry> invalid <price> sl <price> tp1 <price> [tp2 <price> ...]"
+    if len(parts) < 10:
+        return "❌ Usage: /limit <long|short> <SYMBOL> <entry> lev <x> invalid <price> sl <price> tp1 <price> [tp2 <price> ...]"
 
     direction = parts[1].lower()
     if direction not in ("long", "short"):
@@ -1420,7 +1451,7 @@ def parse_limit_command(text):
     i = 4
     while i < len(parts):
         kw = parts[i].lower()
-        if kw in ("invalid", "sl"):
+        if kw in ("lev", "invalid", "sl"):
             if i + 1 >= len(parts):
                 return f"❌ Missing value for '{kw}'"
             keywords[kw] = parts[i + 1]
@@ -1431,19 +1462,24 @@ def parse_limit_command(text):
             keywords[kw] = parts[i + 1]
             i += 2
         else:
-            return f"❌ Unknown keyword: {kw}. Use: invalid, sl, tp1, tp2, ..."
+            return f"❌ Unknown keyword: {kw}. Use: lev, invalid, sl, tp1, tp2, ..."
 
     # Validate required fields
+    if "lev" not in keywords:
+        return "❌ Missing 'lev' (leverage)."
     if "invalid" not in keywords:
         return "❌ Missing 'invalid' price."
     if "sl" not in keywords:
         return "❌ Missing 'sl' (stop loss) price."
 
     try:
+        lev = int(float(keywords["lev"]))
         invalid_price = float(keywords["invalid"])
         sl_price = float(keywords["sl"])
     except ValueError:
-        return "❌ Invalid numeric value for invalid or sl."
+        return "❌ Invalid numeric value for lev, invalid, or sl."
+    if lev <= 0:
+        return "❌ Leverage must be a positive integer."
 
     # Parse TPs
     targets = []
@@ -1463,8 +1499,10 @@ def parse_limit_command(text):
             return "❌ Entry price must be positive."
         if sl_price <= entry:
             return f"❌ For SHORT: SL ({sl_price}) must be above entry ({entry})."
-        if invalid_price <= entry:
-            return f"❌ For SHORT: invalid ({invalid_price}) must be above entry ({entry})."
+        if invalid_price == entry:
+            return f"❌ Invalid price cannot equal entry price ({entry})."
+        if not (targets[0] <= invalid_price <= sl_price):
+            return f"❌ For SHORT: invalid ({invalid_price}) must be between TP1 ({targets[0]}) and SL ({sl_price})."
         for tp in targets:
             if tp >= entry:
                 return f"❌ For SHORT: TP ({tp}) must be below entry ({entry})."
@@ -1476,8 +1514,10 @@ def parse_limit_command(text):
             return "❌ Entry price must be positive."
         if sl_price >= entry:
             return f"❌ For LONG: SL ({sl_price}) must be below entry ({entry})."
-        if invalid_price >= entry:
-            return f"❌ For LONG: invalid ({invalid_price}) must be below entry ({entry})."
+        if invalid_price == entry:
+            return f"❌ Invalid price cannot equal entry price ({entry})."
+        if not (sl_price <= invalid_price <= targets[0]):
+            return f"❌ For LONG: invalid ({invalid_price}) must be between SL ({sl_price}) and TP1 ({targets[0]})."
         for tp in targets:
             if tp <= entry:
                 return f"❌ For LONG: TP ({tp}) must be above entry ({entry})."
@@ -1495,6 +1535,7 @@ def parse_limit_command(text):
         "symbol": symbol,
         "coin": coin,
         "entry": entry,
+        "lev": lev,
         "invalid": invalid_price,
         "sl": sl_price,
         "targets": targets,
@@ -1519,6 +1560,195 @@ def parse_limit_command(text):
     return trade
 
 
+def parse_position_command(text):
+    """Parse /position command and return trade dict or error string.
+    Format: /position <long|short> <SYMBOL> <entry> lev <x> sl <price> tp1 <price> [tp2...]"""
+    parts = text.strip().split()
+    if len(parts) < 9:
+        return "❌ Usage: /position <long|short> <SYMBOL> <entry> lev <x> sl <price> tp1 <price> [tp2 <price> ...]"
+
+    direction = parts[1].lower()
+    if direction not in ("long", "short"):
+        return f"❌ Invalid direction '{direction}'. Use 'long' or 'short'."
+
+    coin = parts[2].upper()
+    symbol = f"{coin}USDT"
+
+    try:
+        entry = float(parts[3])
+    except ValueError:
+        return f"❌ Invalid entry price: {parts[3]}"
+
+    # Parse keyword-value pairs
+    keywords = {}
+    i = 4
+    while i < len(parts):
+        kw = parts[i].lower()
+        if kw in ("lev", "sl"):
+            if i + 1 >= len(parts):
+                return f"❌ Missing value for '{kw}'"
+            keywords[kw] = parts[i + 1]
+            i += 2
+        elif kw.startswith("tp"):
+            if i + 1 >= len(parts):
+                return f"❌ Missing value for '{kw}'"
+            keywords[kw] = parts[i + 1]
+            i += 2
+        elif kw == "invalid":
+            return "❌ /position does not use 'invalid'. For limit orders use /limit."
+        else:
+            return f"❌ Unknown keyword: {kw}. Use: lev, sl, tp1, tp2, ..."
+
+    if "lev" not in keywords:
+        return "❌ Missing 'lev' (leverage)."
+    if "sl" not in keywords:
+        return "❌ Missing 'sl' (stop loss) price."
+
+    try:
+        lev = int(float(keywords["lev"]))
+        sl_price = float(keywords["sl"])
+    except ValueError:
+        return "❌ Invalid numeric value for lev or sl."
+    if lev <= 0:
+        return "❌ Leverage must be a positive integer."
+
+    targets = []
+    tp_keys = sorted([k for k in keywords if k.startswith("tp")], key=lambda x: int(x[2:]))
+    for k in tp_keys:
+        try:
+            targets.append(float(keywords[k]))
+        except ValueError:
+            return f"❌ Invalid price for {k}."
+
+    if not targets:
+        return "❌ At least one tp1 is required."
+
+    # Direction validation
+    if direction == "short":
+        if entry <= 0:
+            return "❌ Entry price must be positive."
+        if sl_price <= entry:
+            return f"❌ For SHORT: SL ({sl_price}) must be above entry ({entry})."
+        for tp in targets:
+            if tp >= entry:
+                return f"❌ For SHORT: TP ({tp}) must be below entry ({entry})."
+        if targets != sorted(targets, reverse=True):
+            return "❌ For SHORT: TP prices should be ordered from highest to lowest (tp1 closest to entry)."
+    else:
+        if entry <= 0:
+            return "❌ Entry price must be positive."
+        if sl_price >= entry:
+            return f"❌ For LONG: SL ({sl_price}) must be below entry ({entry})."
+        for tp in targets:
+            if tp <= entry:
+                return f"❌ For LONG: TP ({tp}) must be above entry ({entry})."
+        if targets != sorted(targets):
+            return "❌ For LONG: TP prices should be ordered from lowest to highest (tp1 closest to entry)."
+
+    now_wib = datetime.now(timezone(timedelta(hours=8)))
+    now_str = now_wib.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    risk_r = abs(entry - sl_price)
+
+    trade = {
+        "id": f"{now_wib.strftime('%m-%d')}-{coin}-{int(entry)}",
+        "created_at": now_str,
+        "direction": direction,
+        "symbol": symbol,
+        "coin": coin,
+        "entry": entry,
+        "lev": lev,
+        "invalid": None,
+        "sl": sl_price,
+        "targets": targets,
+        "status": "active",
+        "risk_r": round(risk_r, 2),
+        "tp_status": [{"price": tp, "hit": False, "hit_at": None} for tp in targets],
+        "sl_hit": False,
+        "sl_hit_at": None,
+        "entry_filled": True,
+        "entry_filled_at": now_str,
+        "invalidated": False,
+        "invalidated_at": None,
+        "all_tps_hit": False,
+        "last_sync": now_str,
+        "notes": "",
+    }
+
+    return trade
+
+
+def process_position_command(text):
+    """Process /position command: parse, check current price, save to journal.
+    Returns (reply_message, trade_or_None)."""
+    result = parse_position_command(text)
+    if isinstance(result, str):
+        return result, None
+
+    trade = result
+    direction = trade["direction"]
+    symbol = trade["symbol"]
+
+    # Fetch current price
+    ticker = api_get("/fapi/v1/ticker/price", {"symbol": symbol})
+    if not ticker or "price" not in ticker:
+        return "⚠️ Could not fetch current price. Trade saved but price not verified.", trade
+
+    current_price = float(ticker["price"])
+    events = []
+
+    # Check SL hit
+    if direction == "short":
+        sl_hit = current_price >= trade["sl"]
+    else:
+        sl_hit = current_price <= trade["sl"]
+
+    if sl_hit:
+        trade["sl_hit"] = True
+        trade["sl_hit_at"] = trade["created_at"]
+        trade["status"] = "stopped_out"
+        events.append(f"💀 SL already hit at {trade['sl']} (current: {current_price})")
+
+    # Check TPs hit
+    if not trade["sl_hit"]:
+        for i, tp in enumerate(trade["tp_status"]):
+            if direction == "short":
+                tp_hit = current_price <= tp["price"]
+            else:
+                tp_hit = current_price >= tp["price"]
+            if tp_hit:
+                tp["hit"] = True
+                tp["hit_at"] = trade["created_at"]
+                r_achieved = abs(tp["price"] - trade["entry"]) / trade["risk_r"] if trade["risk_r"] > 0 else 0
+                events.append(f"🎯 TP{i+1} ({tp['price']}) already hit — {r_achieved:.1f}R")
+
+        if all(tp["hit"] for tp in trade["tp_status"]):
+            trade["all_tps_hit"] = True
+            trade["status"] = "completed"
+            if not any("TP" in e for e in events):
+                events.append("✅ All TPs already hit")
+
+    # Save to journal
+    add_trade_to_journal(trade)
+
+    # Build reply
+    direction_emoji = "🔴 SHORT" if direction == "short" else "🟢 LONG"
+    status_emoji = {"active": "📈", "stopped_out": "💀", "completed": "🏆"}.get(trade["status"], "")
+    tps_lines = []
+    for i, tp in enumerate(trade["tp_status"]):
+        mark = " ✅" if tp["hit"] else ""
+        r_val = abs(tp["price"] - trade["entry"]) / trade["risk_r"] if trade["risk_r"] > 0 else 0
+        tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R){mark}")
+    reply = (
+        f"{status_emoji} Position saved: {direction_emoji} {trade['coin']} @ {trade['entry']} (Lev {trade.get('lev', 1)}x)\n"
+        f"SL: {trade['sl']} | Current: {current_price}\n"
+        + "\n".join(tps_lines)
+    )
+    if events:
+        reply += "\n\n" + "\n".join(events)
+
+    return reply, trade
+
+
 def add_trade_to_journal(trade):
     """Add a trade entry to the current month's journal."""
     now_wib = datetime.now(timezone(timedelta(hours=8)))
@@ -1527,6 +1757,209 @@ def add_trade_to_journal(trade):
     journal["trades"].append(trade)
     save_journal(month_str, journal)
     return True
+
+
+def remove_pending_limit_trade_from_journal(trade_id, month_str=None):
+    """Remove a pending /limit trade from the current month's journal by trade id."""
+    if month_str is None:
+        now_wib = datetime.now(timezone(timedelta(hours=8)))
+        month_str = now_wib.strftime("%Y-%m")
+
+    journal = load_journal(month_str)
+    trades = journal.get("trades", [])
+
+    kept = []
+    removed = []
+    for t in trades:
+        if t.get("id") != trade_id:
+            kept.append(t)
+            continue
+
+        is_limit = t.get("invalid") is not None
+        is_pending = t.get("status") == "pending" and not t.get("entry_filled", False)
+        if is_limit and is_pending:
+            removed.append(t)
+        else:
+            kept.append(t)
+
+    if not removed:
+        return False, "❌ Tidak bisa delete: id tidak ditemukan, atau setup bukan pending /limit."
+
+    journal["trades"] = kept
+    save_journal(month_str, journal)
+    return True, f"🗑️ Deleted {len(removed)} pending /limit setup: {trade_id}"
+
+
+def parse_spot_command(text):
+    """Parse /spot command and return trade dict or error string.
+    Format: /spot <long> <SYMBOL> <entry> sl <price> tp1 <price> [tp2...]"""
+    parts = text.strip().split()
+    if len(parts) < 7:
+        return "❌ Usage: /spot <long> <SYMBOL> <entry> sl <price> tp1 <price> [tp2 <price> ...]"
+
+    direction = parts[1].lower()
+    if direction not in ("long", "buy"):
+        return "❌ Spot hanya mendukung LONG/BUY."
+
+    coin = parts[2].upper()
+
+    try:
+        entry = float(parts[3])
+    except ValueError:
+        return f"❌ Invalid entry price: {parts[3]}"
+
+    keywords = {}
+    i = 4
+    while i < len(parts):
+        kw = parts[i].lower()
+        if kw == "sl":
+            if i + 1 >= len(parts):
+                return f"❌ Missing value for '{kw}'"
+            keywords[kw] = parts[i + 1]
+            i += 2
+        elif kw.startswith("tp"):
+            if i + 1 >= len(parts):
+                return f"❌ Missing value for '{kw}'"
+            keywords[kw] = parts[i + 1]
+            i += 2
+        elif kw == "lev":
+            return "❌ Spot tidak memakai leverage (hapus 'lev')."
+        else:
+            return f"❌ Unknown keyword: {kw}. Use: sl, tp1, tp2, ..."
+
+    if "sl" not in keywords:
+        return "❌ Missing 'sl' (stop loss) price."
+
+    try:
+        sl_price = float(keywords["sl"])
+    except ValueError:
+        return "❌ Invalid numeric value for sl."
+
+    targets = []
+    tp_keys = sorted([k for k in keywords if k.startswith("tp")], key=lambda x: int(x[2:]))
+    for k in tp_keys:
+        try:
+            targets.append(float(keywords[k]))
+        except ValueError:
+            return f"❌ Invalid price for {k}."
+
+    if not targets:
+        return "❌ At least one tp1 is required."
+
+    if entry <= 0:
+        return "❌ Entry price must be positive."
+    if sl_price >= entry:
+        return f"❌ For SPOT LONG: SL ({sl_price}) must be below entry ({entry})."
+    for tp in targets:
+        if tp <= entry:
+            return f"❌ For SPOT LONG: TP ({tp}) must be above entry ({entry})."
+    if targets != sorted(targets):
+        return "❌ For SPOT LONG: TP prices should be ordered from lowest to highest (tp1 closest to entry)."
+
+    now_wib = datetime.now(timezone(timedelta(hours=8)))
+    now_str = now_wib.strftime("%Y-%m-%dT%H:%M:%S+08:00")
+    risk_r = abs(entry - sl_price)
+    trade = {
+        "id": f"{now_wib.strftime('%m-%d')}-{coin}-{int(entry)}",
+        "created_at": now_str,
+        "market": "spot",
+        "direction": "long",
+        "coin": coin,
+        "entry": entry,
+        "sl": sl_price,
+        "targets": targets,
+        "status": "active",
+        "risk_r": round(risk_r, 2),
+        "tp_status": [{"price": tp, "hit": False, "hit_at": None} for tp in targets],
+        "sl_hit": False,
+        "sl_hit_at": None,
+        "notes": "",
+    }
+    return trade
+
+
+def add_spot_trade_to_journal(trade):
+    """Add a spot trade entry to the current month's spot journal."""
+    now_wib = datetime.now(timezone(timedelta(hours=8)))
+    month_str = now_wib.strftime("%Y-%m")
+    journal = load_spot_journal(month_str)
+    journal["trades"].append(trade)
+    save_spot_journal(month_str, journal)
+    return True
+
+
+def generate_spot_stats(month_str=None):
+    """Generate monthly spot trade statistics."""
+    if month_str is None:
+        now_wib = datetime.now(timezone(timedelta(hours=8)))
+        month_str = now_wib.strftime("%Y-%m")
+
+    journal = load_spot_journal(month_str)
+    trades = journal.get("trades", [])
+    if not trades:
+        return "🟩 **Spot Journal** — {}\n\nNo trades recorded this month.".format(month_str)
+
+    total = len(trades)
+    status_counts = {}
+    for t in trades:
+        s = t.get("status", "active")
+        status_counts[s] = status_counts.get(s, 0) + 1
+
+    resolved = [t for t in trades if t.get("status") in ("completed", "stopped_out")]
+    winners = [t for t in resolved if t["status"] == "completed"]
+    win_rate = (len(winners) / len(resolved) * 100) if resolved else 0
+
+    rr_values = []
+    roi_values = []
+    for t in resolved:
+        if t.get("status") == "completed":
+            best_tp = None
+            for tp in t["tp_status"]:
+                if tp["hit"]:
+                    best_tp = tp["price"]
+            if best_tp and t.get("risk_r", 0) > 0:
+                r_val = (best_tp - t["entry"]) / t["risk_r"]
+                roi = (best_tp - t["entry"]) / t["entry"] * 100
+                rr_values.append(r_val)
+                roi_values.append(roi)
+        else:
+            rr_values.append(-1.0)
+            roi_values.append(-(t.get("entry", 0) - t.get("sl", t.get("entry", 0) - 1)) / t.get("entry", 1) * 100)
+
+    avg_rr = sum(rr_values) / len(rr_values) if rr_values else 0
+    avg_roi = sum(roi_values) / len(roi_values) if roi_values else 0
+    best_rr = max(rr_values) if rr_values else 0
+    worst_rr = min(rr_values) if rr_values else 0
+
+    best_trade = ""
+    worst_trade = ""
+    if rr_values:
+        best_idx = rr_values.index(best_rr)
+        worst_idx = rr_values.index(worst_rr)
+        bcoin = resolved[best_idx].get("coin", "??")
+        best_trade = f"{bcoin} +{best_rr:.1f}R (+{roi_values[best_idx]:.1f}%)"
+        wcoin = resolved[worst_idx].get("coin", "??")
+        worst_trade = f"{wcoin} {worst_rr:.1f}R ({roi_values[worst_idx]:.1f}%)"
+
+    active = status_counts.get("active", 0)
+    completed = status_counts.get("completed", 0)
+    stopped = status_counts.get("stopped_out", 0)
+
+    lines = [
+        f"🟩 **Spot Journal** — {month_str}",
+        f"",
+        f"Trades: {total} | ✅ Complete: {completed} | ❌ Stopped: {stopped}",
+        f"📌 Active: {active}",
+        f"",
+    ]
+    if resolved:
+        lines.append(f"Win Rate: {win_rate:.1f}% ({completed}/{len(resolved)} resolved)")
+        lines.append(f"Avg R:R: {avg_rr:+.1f}R | Avg ROI: {avg_roi:+.1f}%")
+        lines.append(f"")
+        lines.append(f"🏆 Best: {best_trade}")
+        lines.append(f"💀 Worst: {worst_trade}")
+
+    return "\n".join(lines)
 
 
 def check_level_crossing(trade, klines):
@@ -1558,11 +1991,11 @@ def check_level_crossing(trade, klines):
 
         if direction == "short":
             crosses_entry = cross_up(trade["entry"])
-            crosses_invalid = cross_up(trade["invalid"])
+            crosses_invalid = trade["invalid"] is not None and cross_up(trade["invalid"])
             crosses_sl = cross_up(trade["sl"])
         else:
             crosses_entry = cross_down(trade["entry"])
-            crosses_invalid = cross_down(trade["invalid"])
+            crosses_invalid = trade["invalid"] is not None and cross_down(trade["invalid"])
             crosses_sl = cross_down(trade["sl"])
 
         # Priority: invalid > SL > entry > TPs
@@ -1706,6 +2139,9 @@ def generate_perps_stats(month_str=None):
     rr_values = []
     roi_values = []
     for t in resolved:
+        lev = int(t.get("lev", 1) or 1)
+        if lev <= 0:
+            lev = 1
         if t.get("status") == "completed":
             # Best TP hit
             best_tp = None
@@ -1715,18 +2151,18 @@ def generate_perps_stats(month_str=None):
             if best_tp and t.get("risk_r", 0) > 0:
                 if t.get("direction") == "short":
                     r_val = (t["entry"] - best_tp) / t["risk_r"]
-                    roi = (t["entry"] - best_tp) / t["entry"] * 100
+                    roi = (t["entry"] - best_tp) / t["entry"] * 100 * lev
                 else:
                     r_val = (best_tp - t["entry"]) / t["risk_r"]
-                    roi = (best_tp - t["entry"]) / t["entry"] * 100
+                    roi = (best_tp - t["entry"]) / t["entry"] * 100 * lev
                 rr_values.append(r_val)
                 roi_values.append(roi)
         else:  # stopped_out
             rr_values.append(-1.0)
             if t.get("direction") == "short":
-                roi_values.append(-(t.get("sl", t.get("entry", 0) + 1) - t.get("entry", 0)) / t.get("entry", 1) * 100)
+                roi_values.append(-(t.get("sl", t.get("entry", 0) + 1) - t.get("entry", 0)) / t.get("entry", 1) * 100 * lev)
             else:
-                roi_values.append(-(t.get("entry", 0) - t.get("sl", t.get("entry", 0) - 1)) / t.get("entry", 1) * 100)
+                roi_values.append(-(t.get("entry", 0) - t.get("sl", t.get("entry", 0) - 1)) / t.get("entry", 1) * 100 * lev)
 
     avg_rr = sum(rr_values) / len(rr_values) if rr_values else 0
     avg_roi = sum(roi_values) / len(roi_values) if roi_values else 0
@@ -1868,12 +2304,52 @@ def check_telegram_commands(conn):
                         r_val = abs(tp["price"] - result["entry"]) / result["risk_r"] if result["risk_r"] > 0 else 0
                         tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R)")
                     reply = (
-                        f"✅ Trade saved: {direction_emoji} {result['coin']} @ {result['entry']}\n"
+                        f"✅ Trade saved: {direction_emoji} {result['coin']} @ {result['entry']} (Lev {result.get('lev', 1)}x)\n"
                         f"SL: {result['sl']} | Invalid: {result['invalid']}\n"
                         + "\n".join(tps_lines)
                     )
+                    reply += f"\n\nID: {result['id']}"
                     send_telegram_plain(reply)
                     print(f"[TG] Trade saved: {result['id']}")
+                LAST_TG_UPDATE_ID = update["update_id"]
+            elif text.startswith("/position"):
+                print(f"[TG] /position received: {text[:80]}")
+                reply, _ = process_position_command(text)
+                send_telegram_plain(reply)
+                print(f"[TG] /position processed")
+                LAST_TG_UPDATE_ID = update["update_id"]
+            elif text.startswith("/delete") or text.startswith("/del"):
+                parts = text.strip().split()
+                if len(parts) < 2:
+                    send_telegram_plain("❌ Usage: /delete <trade_id>\nExample: /delete 05-15-BTC-81000")
+                else:
+                    _, msg = remove_pending_limit_trade_from_journal(parts[1])
+                    send_telegram_plain(msg)
+                LAST_TG_UPDATE_ID = update["update_id"]
+            elif text == "/spot":
+                try:
+                    stats_text = generate_spot_stats()
+                    send_telegram_plain(stats_text)
+                except Exception as e:
+                    print(f"[TG] Spot stats failed: {e}")
+                    send_telegram_plain("Error generating spot stats. Check logs.")
+                LAST_TG_UPDATE_ID = update["update_id"]
+            elif text.startswith("/spot"):
+                result = parse_spot_command(text)
+                if isinstance(result, str):
+                    send_telegram_plain(result)
+                else:
+                    add_spot_trade_to_journal(result)
+                    tps_lines = []
+                    for i, tp in enumerate(result["tp_status"]):
+                        r_val = abs(tp["price"] - result["entry"]) / result["risk_r"] if result["risk_r"] > 0 else 0
+                        tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R)")
+                    reply = (
+                        f"✅ Spot trade saved: 🟢 LONG {result['coin']} @ {result['entry']}\n"
+                        f"SL: {result['sl']}\n"
+                        + "\n".join(tps_lines)
+                    )
+                    send_telegram_plain(reply)
                 LAST_TG_UPDATE_ID = update["update_id"]
             elif text == "/perps":
                 if not review_sent:
@@ -1910,6 +2386,19 @@ def check_telegram_commands(conn):
                         print(f"[TG] Review generation failed: {e}")
                         send_telegram_plain("Error generating review report. Check logs.")
                     review_sent = True
+                LAST_TG_UPDATE_ID = update["update_id"]
+            elif text == "/help":
+                send_telegram_plain(
+                    "Commands:\n"
+                    "/btc - Today's BTC bias brief\n"
+                    "/review - Signal tracker performance report\n"
+                    "/limit - Add limit setup (e.g. /limit short BTC 81000 lev 20 invalid 81400 sl 81500 tp1 79000 tp2 78000)\n"
+                    "/delete - Delete pending /limit setup (e.g. /delete 05-15-BTC-81000)\n"
+                    "/position - Add market position (e.g. /position short BTC 80000 lev 20 sl 81000 tp1 79000 tp2 78000)\n"
+                    "/perps - Monthly perps trade stats\n"
+                    "/spot - Spot journal stats\n"
+                    "/spot <...> - Add spot position (e.g. /spot long BTC 81000 sl 80000 tp1 83000 tp2 85000)"
+                )
                 LAST_TG_UPDATE_ID = update["update_id"]
             else:
                 LAST_TG_UPDATE_ID = update["update_id"]
@@ -1989,12 +2478,25 @@ def listen_commands():
                             r_val = abs(tp["price"] - result["entry"]) / result["risk_r"] if result["risk_r"] > 0 else 0
                             tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R)")
                         reply = (
-                            f"✅ Trade saved: {direction_emoji} {result['coin']} @ {result['entry']}\n"
+                            f"✅ Trade saved: {direction_emoji} {result['coin']} @ {result['entry']} (Lev {result.get('lev', 1)}x)\n"
                             f"SL: {result['sl']} | Invalid: {result['invalid']}\n"
                             + "\n".join(tps_lines)
                         )
+                        reply += f"\n\nID: {result['id']}"
                         send_telegram_plain(reply)
                         print(f"[TG] Trade saved: {result['id']}")
+                elif text.startswith("/position"):
+                    print(f"[TG] /position received: {text[:80]}")
+                    reply, _ = process_position_command(text)
+                    send_telegram_plain(reply)
+                    print(f"[TG] /position processed")
+                elif text.startswith("/delete") or text.startswith("/del"):
+                    parts = text.strip().split()
+                    if len(parts) < 2:
+                        send_telegram_plain("❌ Usage: /delete <trade_id>\nExample: /delete 05-15-BTC-81000")
+                    else:
+                        _, msg = remove_pending_limit_trade_from_journal(parts[1])
+                        send_telegram_plain(msg)
                 elif text == "/perps":
                     print("[TG] /perps received")
                     try:
@@ -2004,6 +2506,34 @@ def listen_commands():
                     except Exception as e:
                         print(f"[TG] Perps stats error: {e}")
                         send_telegram_plain(f"Error: {e}")
+                elif text == "/spot":
+                    print("[TG] /spot received")
+                    try:
+                        stats_text = generate_spot_stats()
+                        send_telegram_plain(stats_text)
+                        print("[TG] Spot stats sent")
+                    except Exception as e:
+                        print(f"[TG] Spot stats error: {e}")
+                        send_telegram_plain(f"Error: {e}")
+                elif text.startswith("/spot"):
+                    print(f"[TG] /spot received: {text[:80]}")
+                    result = parse_spot_command(text)
+                    if isinstance(result, str):
+                        send_telegram_plain(result)
+                        print(f"[TG] /spot error: {result[:80]}")
+                    else:
+                        add_spot_trade_to_journal(result)
+                        tps_lines = []
+                        for i, tp in enumerate(result["tp_status"]):
+                            r_val = abs(tp["price"] - result["entry"]) / result["risk_r"] if result["risk_r"] > 0 else 0
+                            tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R)")
+                        reply = (
+                            f"✅ Spot trade saved: 🟢 LONG {result['coin']} @ {result['entry']}\n"
+                            f"SL: {result['sl']}\n"
+                            + "\n".join(tps_lines)
+                        )
+                        send_telegram_plain(reply)
+                        print(f"[TG] Spot trade saved: {result['id']}")
                 elif text == "/btc":
                     print("[TG] /btc received")
                     try:
@@ -2023,7 +2553,17 @@ def listen_commands():
                         print(f"[TG] Review error: {e}")
                         send_telegram_plain(f"Error: {e}")
                 elif text == "/help":
-                    send_telegram_plain("Commands:\n/btc - Today's BTC bias brief\n/review - Signal tracker performance report\n/limit - Set trade limit (e.g. /limit short BTC 81000 invalid 81400 sl 81500 tp1 79000 tp2 78000)\n/perps - Monthly perps trade stats")
+                    send_telegram_plain(
+                        "Commands:\n"
+                        "/btc - Today's BTC bias brief\n"
+                        "/review - Signal tracker performance report\n"
+                        "/limit - Add limit setup (e.g. /limit short BTC 81000 lev 20 invalid 81400 sl 81500 tp1 79000 tp2 78000)\n"
+                        "/delete - Delete pending /limit setup (e.g. /delete 05-15-BTC-81000)\n"
+                        "/position - Add market position (e.g. /position short BTC 80000 lev 20 sl 81000 tp1 79000 tp2 78000)\n"
+                        "/perps - Monthly perps trade stats\n"
+                        "/spot - Spot journal stats\n"
+                        "/spot <...> - Add spot position (e.g. /spot long BTC 81000 sl 80000 tp1 83000 tp2 85000)"
+                    )
 
                 LAST_TG_UPDATE_ID = update["update_id"]
                 if LAST_TG_UPDATE_ID > stored_id:

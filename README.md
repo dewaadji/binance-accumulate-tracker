@@ -160,7 +160,10 @@ python3 accumulation_radar.py full
 
 ## Trade Journal
 
-A built-in trade journal for tracking limit trade setups. All data stored as JSON files under `data/journal/YYYY-MM.json`.
+A built-in trade journal for tracking trade setups.
+
+- **Perps journal**: `data/journal/YYYY-MM.json`
+- **Spot journal**: `data/spot_journal/YYYY-MM.json`
 
 ### BTC Daily Brief (`btc` mode)
 
@@ -190,7 +193,10 @@ Or enable passive command checking in `oi` mode by setting `TG_POLL_COMMANDS_IN_
 | Command | Description | Example |
 |---------|-------------|---------|
 | `/btc` | Show today's BTC bias brief (auto-generates if past 00:30 UTC) | `/btc` |
-| `/limit` | Add a new limit trade setup | `/limit short BTC 81000 invalid 81400 sl 81500 tp1 79000 tp2 78000 tp3 77000` |
+| `/limit` | Add a new perps limit trade setup (requires leverage) | `/limit short BTC 81000 lev 20 invalid 81400 sl 81500 tp1 79000 tp2 78000 tp3 77000` |
+| `/position` | Add a new perps market position (requires leverage) | `/position short BTC 81000 lev 20 sl 81500 tp1 79000 tp2 78000 tp3 77000` |
+| `/delete` | Delete a pending `/limit` setup (cannot delete `/position`) | `/delete 05-15-BTC-81000` |
+| `/spot` | Spot journal: send `/spot` for stats, or `/spot ...` to add a position | `/spot long BTC 81000 sl 80000 tp1 83000 tp2 85000` |
 | `/perps` | Show current month perps trade statistics | `/perps` |
 | `/review` | Signal tracker performance report | `/review` |
 | `/help` | List available commands | `/help` |
@@ -198,19 +204,65 @@ Or enable passive command checking in `oi` mode by setting `TG_POLL_COMMANDS_IN_
 #### `/limit` Format
 
 ```
-/limit <long|short> <SYMBOL> <entry> invalid <price> sl <price> tp1 <price> [tp2 <price> ...]
+/limit <long|short> <SYMBOL> <entry> lev <x> invalid <price> sl <price> tp1 <price> [tp2 <price> ...]
 ```
 
 - **direction**: `long` or `short`
 - **symbol**: any USDT perpetual (e.g., `BTC`, `ETH`, `SOL`)
 - **entry**: limit order entry price
+- **lev**: leverage multiplier (e.g., `20`)
 - **invalid**: price level that invalidates the setup (before entry fills)
 - **sl**: stop loss price
 - **tp1, tp2, ...**: take profit levels (minimum 1, unlimited maximum)
 
 Example:
 ```
-/limit short BTC 81000 invalid 81400 sl 81500 tp1 79000 tp2 78000 tp3 77000
+/limit short BTC 81000 lev 20 invalid 81400 sl 81500 tp1 79000 tp2 78000 tp3 77000
+```
+
+#### `/position` Format
+
+Use this when you already entered a market position (so it’s immediately tracked as `active`).
+
+```
+/position <long|short> <SYMBOL> <entry> lev <x> sl <price> tp1 <price> [tp2 <price> ...]
+```
+
+Example:
+```
+/position short BTC 81000 lev 20 sl 81500 tp1 79000 tp2 78000 tp3 77000
+```
+
+#### `/delete` Format
+
+Delete only works for pending limit setups created by `/limit`. It will refuse to delete active/completed trades and any `/position` entry.
+
+```
+/delete <trade_id>
+```
+
+Example:
+```
+/delete 05-15-BTC-81000
+```
+
+#### `/spot` Format
+
+Spot trades do not use leverage and are stored in a separate monthly JSON.
+
+Show current month spot stats:
+```
+/spot
+```
+
+Add a spot position:
+```
+/spot long <SYMBOL> <entry> sl <price> tp1 <price> [tp2 <price> ...]
+```
+
+Example:
+```
+/spot long BTC 81000 sl 80000 tp1 83000 tp2 85000
 ```
 
 #### `/perps` Output Example
@@ -222,7 +274,7 @@ Trades: 15 | ✅ Complete: 6 | ❌ Stopped: 3
 ⏳ Active: 2 | 🕐 Pending: 3 | 🚫 Invalid: 1
 
 Win Rate: 66.7% (6/9 resolved)
-Avg R:R: +2.4R | Avg ROI: +3.8%
+Avg R:R: +2.4R | Avg ROI: +3.8%  (ROI is leverage-adjusted)
 
 🏆 Best: BTC SHORT +6.0R (+7.4%)
 💀 Worst: ETH LONG -1.0R (-2.1%)
