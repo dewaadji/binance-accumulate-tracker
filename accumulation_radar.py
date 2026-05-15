@@ -1790,6 +1790,172 @@ def remove_pending_limit_trade_from_journal(trade_id, month_str=None):
     return True, f"🗑️ Deleted {len(removed)} pending /limit setup: {trade_id}"
 
 
+def _month_candidates_for_lookup():
+    now_wib = datetime.now(timezone(timedelta(hours=8)))
+    cur = now_wib.strftime("%Y-%m")
+    prev = (now_wib.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+    return [cur] if prev == cur else [cur, prev]
+
+
+def _available_months_in_dir(dir_path):
+    try:
+        base = Path(dir_path)
+        if not base.exists():
+            return []
+        months = []
+        for p in base.glob("*.json"):
+            stem = p.stem
+            if len(stem) == 7 and stem[4] == "-" and stem[:4].isdigit() and stem[5:].isdigit():
+                months.append(stem)
+        return sorted(set(months), reverse=True)
+    except Exception:
+        return []
+
+
+def _validate_entry_change_perps(trade, new_entry):
+    if new_entry <= 0:
+        return "❌ Entry price must be positive."
+
+    direction = trade.get("direction", "").lower()
+    if direction not in ("long", "short"):
+        return "❌ Invalid trade direction."
+
+    sl = float(trade.get("sl", 0))
+    targets = trade.get("targets") or [tp.get("price") for tp in trade.get("tp_status", [])]
+    targets = [float(x) for x in targets if x is not None]
+    if not targets:
+        return "❌ Trade has no targets."
+
+    invalid = trade.get("invalid", None)
+    if invalid is not None:
+        invalid = float(invalid)
+        if invalid == new_entry:
+            return "❌ Invalid price cannot equal entry price."
+        if direction == "short":
+            tp1 = max(targets)
+            if not (tp1 <= invalid <= sl):
+                return "❌ Invalid price must be between TP1 and SL."
+        else:
+            tp1 = min(targets)
+            if not (sl <= invalid <= tp1):
+                return "❌ Invalid price must be between SL and TP1."
+
+    if direction == "short":
+        if sl <= new_entry:
+            return f"❌ For SHORT: SL ({sl}) must be above entry ({new_entry})."
+        for tp in targets:
+            if tp >= new_entry:
+                return f"❌ For SHORT: TP ({tp}) must be below entry ({new_entry})."
+    else:
+        if sl >= new_entry:
+            return f"❌ For LONG: SL ({sl}) must be below entry ({new_entry})."
+        for tp in targets:
+            if tp <= new_entry:
+                return f"❌ For LONG: TP ({tp}) must be above entry ({new_entry})."
+
+    return None
+
+
+def adjust_perps_trade_entry(trade_id, new_entry):
+    month_candidates = list(_month_candidates_for_lookup())
+    for m in _available_months_in_dir(JOURNAL_DIR):
+        if m not in month_candidates:
+            month_candidates.append(m)
+        if len(month_candidates) >= 24:
+            break
+
+    for month_str in month_candidates:
+        journal = load_journal(month_str)
+        trades = journal.get("trades", [])
+
+        match_idx = None
+        for idx in range(len(trades) - 1, -1, -1):
+            if trades[idx].get("id") == trade_id:
+                match_idx = idx
+                break
+        if match_idx is None:
+            continue
+
+        trade = trades[match_idx]
+        if trade.get("status") in ("completed", "stopped_out", "invalidated"):
+            return False, "❌ Tidak bisa adjust: trade sudah selesai."
+
+        err = _validate_entry_change_perps(trade, new_entry)
+        if err:
+            return False, err
+
+        old_entry = float(trade.get("entry", 0))
+        trade["entry"] = float(new_entry)
+        trade["risk_r"] = round(abs(trade["entry"] - float(trade.get("sl", 0))), 2)
+        trade["entry_adjusted_at"] = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        trades[match_idx] = trade
+        journal["trades"] = trades
+        save_journal(month_str, journal)
+
+        return True, f"✅ PERPS entry adjusted: {trade_id}\n{trade.get('coin','??')} {trade.get('direction','').upper()} | {old_entry} → {trade['entry']}"
+
+    return False, "❌ Trade ID tidak ditemukan di perps journal (bulan ini/kemarin)."
+
+
+def _validate_entry_change_spot(trade, new_entry):
+    if new_entry <= 0:
+        return "❌ Entry price must be positive."
+
+    sl = float(trade.get("sl", 0))
+    targets = trade.get("targets") or [tp.get("price") for tp in trade.get("tp_status", [])]
+    targets = [float(x) for x in targets if x is not None]
+    if not targets:
+        return "❌ Trade has no targets."
+
+    if sl >= new_entry:
+        return f"❌ For SPOT LONG: SL ({sl}) must be below entry ({new_entry})."
+    for tp in targets:
+        if tp <= new_entry:
+            return f"❌ For SPOT LONG: TP ({tp}) must be above entry ({new_entry})."
+    return None
+
+
+def adjust_spot_trade_entry(trade_id, new_entry):
+    month_candidates = list(_month_candidates_for_lookup())
+    for m in _available_months_in_dir(SPOT_JOURNAL_DIR):
+        if m not in month_candidates:
+            month_candidates.append(m)
+        if len(month_candidates) >= 24:
+            break
+
+    for month_str in month_candidates:
+        journal = load_spot_journal(month_str)
+        trades = journal.get("trades", [])
+
+        match_idx = None
+        for idx in range(len(trades) - 1, -1, -1):
+            if trades[idx].get("id") == trade_id:
+                match_idx = idx
+                break
+        if match_idx is None:
+            continue
+
+        trade = trades[match_idx]
+        if trade.get("status") in ("completed", "stopped_out"):
+            return False, "❌ Tidak bisa adjust: trade sudah selesai."
+
+        err = _validate_entry_change_spot(trade, new_entry)
+        if err:
+            return False, err
+
+        old_entry = float(trade.get("entry", 0))
+        trade["entry"] = float(new_entry)
+        trade["risk_r"] = round(abs(trade["entry"] - float(trade.get("sl", 0))), 2)
+        trade["entry_adjusted_at"] = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
+        trades[match_idx] = trade
+        journal["trades"] = trades
+        save_spot_journal(month_str, journal)
+
+        return True, f"✅ SPOT entry adjusted: {trade_id}\n{trade.get('coin','??')} | {old_entry} → {trade['entry']}"
+
+    return False, "❌ Trade ID tidak ditemukan di spot journal."
+
+
 def parse_spot_command(text):
     """Parse /spot command and return trade dict or error string.
     Format: /spot <long> <SYMBOL> <entry> sl <price> tp1 <price> [tp2...]"""
@@ -1958,6 +2124,23 @@ def generate_spot_stats(month_str=None):
         lines.append(f"")
         lines.append(f"🏆 Best: {best_trade}")
         lines.append(f"💀 Worst: {worst_trade}")
+
+    active_trades = [t for t in trades if t.get("status") == "active"]
+    if active_trades:
+        lines.append(f"")
+        lines.append(f"**Active Spot Trades** — {len(active_trades)}")
+        max_list = 30
+        for t in active_trades[:max_list]:
+            tps_hit = sum(1 for tp in t.get("tp_status", []) if tp.get("hit"))
+            tps_total = len(t.get("tp_status", []))
+            lines.append(
+                f"  {t.get('coin','??')} | "
+                f"Entry {t.get('entry','?')} | SL {t.get('sl','?')} | "
+                f"TP {tps_hit}/{tps_total} | "
+                f"ID: {t.get('id','')}"
+            )
+        if len(active_trades) > max_list:
+            lines.append(f"  ... +{len(active_trades) - max_list} more")
 
     return "\n".join(lines)
 
@@ -2235,6 +2418,26 @@ def generate_perps_stats(month_str=None):
         short_detail += "/".join(parts_s) + ")"
         lines.append(f"Short: {short_detail}")
 
+    active_trades = [t for t in trades if t.get("status") == "active"]
+    if active_trades:
+        lines.append(f"")
+        lines.append(f"**Active Trades** — {len(active_trades)}")
+        max_list = 30
+        for t in active_trades[:max_list]:
+            lev = int(t.get("lev", 1) or 1)
+            if lev <= 0:
+                lev = 1
+            tps_hit = sum(1 for tp in t.get("tp_status", []) if tp.get("hit"))
+            tps_total = len(t.get("tp_status", []))
+            lines.append(
+                f"  {t.get('coin','??')} {t.get('direction','??').upper()} | "
+                f"Entry {t.get('entry','?')} | Lev {lev}x | "
+                f"SL {t.get('sl','?')} | TP {tps_hit}/{tps_total} | "
+                f"ID: {t.get('id','')}"
+            )
+        if len(active_trades) > max_list:
+            lines.append(f"  ... +{len(active_trades) - max_list} more")
+
     pending_limit_setups = [
         t for t in trades
         if t.get("status") == "pending"
@@ -2348,6 +2551,31 @@ def check_telegram_commands(conn):
                     _, msg = remove_pending_limit_trade_from_journal(parts[1])
                     send_telegram_plain(msg)
                 LAST_TG_UPDATE_ID = update["update_id"]
+            elif text.startswith("/adjust"):
+                parts = text.strip().split()
+                if len(parts) == 3:
+                    trade_id = parts[1]
+                    new_entry_raw = parts[2]
+                elif len(parts) == 4 and parts[2].lower() == "entry":
+                    trade_id = parts[1]
+                    new_entry_raw = parts[3]
+                else:
+                    send_telegram_plain("❌ Usage: /adjust <trade_id> <new_entry>\nExample: /adjust 05-15-BTC-81000 80500")
+                    LAST_TG_UPDATE_ID = update["update_id"]
+                    continue
+
+                try:
+                    new_entry = float(new_entry_raw)
+                except ValueError:
+                    send_telegram_plain(f"❌ Invalid entry price: {new_entry_raw}")
+                    LAST_TG_UPDATE_ID = update["update_id"]
+                    continue
+
+                ok, msg = adjust_perps_trade_entry(trade_id, new_entry)
+                if (not ok) and ("tidak ditemukan" in msg.lower()):
+                    ok, msg = adjust_spot_trade_entry(trade_id, new_entry)
+                send_telegram_plain(msg)
+                LAST_TG_UPDATE_ID = update["update_id"]
             elif text == "/spot":
                 try:
                     stats_text = generate_spot_stats()
@@ -2416,6 +2644,7 @@ def check_telegram_commands(conn):
                     "/review - Signal tracker performance report\n"
                     "/limit - Add limit setup (e.g. /limit short BTC 81000 lev 20 invalid 81400 sl 81500 tp1 79000 tp2 78000)\n"
                     "/delete - Delete pending /limit setup (e.g. /delete 05-15-BTC-81000)\n"
+                    "/adjust - Adjust entry price (e.g. /adjust 05-15-BTC-81000 80500)\n"
                     "/position - Add market position (e.g. /position short BTC 80000 lev 20 sl 81000 tp1 79000 tp2 78000)\n"
                     "/perps - Monthly perps trade stats\n"
                     "/spot - Spot journal stats\n"
@@ -2519,6 +2748,28 @@ def listen_commands():
                     else:
                         _, msg = remove_pending_limit_trade_from_journal(parts[1])
                         send_telegram_plain(msg)
+                elif text.startswith("/adjust"):
+                    parts = text.strip().split()
+                    if len(parts) == 3:
+                        trade_id = parts[1]
+                        new_entry_raw = parts[2]
+                    elif len(parts) == 4 and parts[2].lower() == "entry":
+                        trade_id = parts[1]
+                        new_entry_raw = parts[3]
+                    else:
+                        send_telegram_plain("❌ Usage: /adjust <trade_id> <new_entry>\nExample: /adjust 05-15-BTC-81000 80500")
+                        continue
+
+                    try:
+                        new_entry = float(new_entry_raw)
+                    except ValueError:
+                        send_telegram_plain(f"❌ Invalid entry price: {new_entry_raw}")
+                        continue
+
+                    ok, msg = adjust_perps_trade_entry(trade_id, new_entry)
+                    if (not ok) and ("tidak ditemukan" in msg.lower()):
+                        ok, msg = adjust_spot_trade_entry(trade_id, new_entry)
+                    send_telegram_plain(msg)
                 elif text == "/perps":
                     print("[TG] /perps received")
                     try:
@@ -2581,6 +2832,7 @@ def listen_commands():
                         "/review - Signal tracker performance report\n"
                         "/limit - Add limit setup (e.g. /limit short BTC 81000 lev 20 invalid 81400 sl 81500 tp1 79000 tp2 78000)\n"
                         "/delete - Delete pending /limit setup (e.g. /delete 05-15-BTC-81000)\n"
+                        "/adjust - Adjust entry price (e.g. /adjust 05-15-BTC-81000 80500)\n"
                         "/position - Add market position (e.g. /position short BTC 80000 lev 20 sl 81000 tp1 79000 tp2 78000)\n"
                         "/perps - Monthly perps trade stats\n"
                         "/spot - Spot journal stats\n"
