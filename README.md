@@ -189,6 +189,7 @@ Or enable passive command checking in `oi` mode by setting `TG_POLL_COMMANDS_IN_
 
 | Command | Description | Example |
 |---------|-------------|---------|
+| `/btc` | Show today's BTC bias brief (auto-generates if past 00:30 UTC) | `/btc` |
 | `/limit` | Add a new limit trade setup | `/limit short BTC 81000 invalid 81400 sl 81500 tp1 79000 tp2 78000 tp3 77000` |
 | `/perps` | Show current month perps trade statistics | `/perps` |
 | `/review` | Signal tracker performance report | `/review` |

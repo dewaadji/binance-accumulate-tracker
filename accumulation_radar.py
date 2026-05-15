@@ -1314,19 +1314,42 @@ def generate_btc_brief():
     journal["btc_briefs"].append(brief)
     save_journal(month_str, journal)
 
-    # Build Telegram message
-    emoji = "🟢" if bias == "bullish" else "🔴" if bias == "bearish" else "🟡"
+    full_brief = format_btc_brief_message(brief)
+    send_telegram(full_brief)
+
+    print(f"  ✅ BTC brief saved: {bias.upper()} ({confidence})")
+    return brief
+
+
+def format_btc_brief_message(brief):
+    """Build Telegram message string from a BTC brief dict."""
+    emoji = "🟢" if brief.get("bias") == "bullish" else "🔴" if brief.get("bias") == "bearish" else "🟡"
+    confidence = brief.get("confidence", "low")
     conf_indicator = "◆◆◆" if confidence == "high" else "◆◆" if confidence == "medium" else "◆"
+    price = brief.get("price", 0)
+    ema21 = brief.get("ema21", 0)
+    ema55 = brief.get("ema55", 0)
+    ema200 = brief.get("ema200", 0)
+    rsi14 = brief.get("rsi14", 0)
+    funding_rate = brief.get("funding_rate", 0)
+    funding_trend = brief.get("funding_trend", "neutral")
+    oi_delta_pct = brief.get("oi_delta_pct", 0)
+    volume_ratio = brief.get("volume_ratio", 0)
+    support = brief.get("support", 0)
+    resistance = brief.get("resistance", 0)
+    signals = brief.get("signals", [])
+    summary = brief.get("summary", "")
+
     lines_brief = [
         f"📊 **BTC Daily Brief** — {brief['date']} WIB",
         f"",
-        f"{emoji} **{bias.upper()}** ({confidence} confidence {conf_indicator})",
-        f"Price: ${current_price:,.0f}",
+        f"{emoji} **{brief.get('bias', '').upper()}** ({confidence} confidence {conf_indicator})",
+        f"Price: ${price:,.0f}",
         f"",
         f"📉 **Technicals**:",
         f"EMA21 ${ema21:,.0f} | EMA55 ${ema55:,.0f}" + (f" | EMA200 ${ema200:,.0f}" if ema200 else ""),
         f"RSI 14: {rsi14:.1f}",
-        f"Key support: ${brief['support']:,.0f} | Resistance: ${brief['resistance']:,.0f}",
+        f"Key support: ${support:,.0f} | Resistance: ${resistance:,.0f}",
         f"",
         f"💸 **Funding & OI**:",
         f"Funding: {funding_rate:+.4%} ({funding_trend} trend)",
@@ -1341,11 +1364,33 @@ def generate_btc_brief():
     lines_brief.append(f"")
     lines_brief.append(f"**Summary**: {summary}")
 
-    full_brief = "\n".join(lines_brief)
-    send_telegram(full_brief)
+    return "\n".join(lines_brief)
 
-    print(f"  ✅ BTC brief saved: {bias.upper()} ({confidence})")
-    return brief
+
+def get_btc_brief_today():
+    """Get today's BTC brief. If not yet generated and past 00:30 UTC, auto-generate.
+    Returns (message_string, brief_dict_or_None)."""
+    now_wib = datetime.now(timezone(timedelta(hours=8)))
+    today_str = now_wib.strftime("%Y-%m-%d")
+    month_str = now_wib.strftime("%Y-%m")
+
+    journal = load_journal(month_str)
+
+    for brief in journal.get("btc_briefs", []):
+        if brief.get("date") == today_str:
+            return format_btc_brief_message(brief), brief
+
+    # Not found — check if we should auto-generate
+    now_utc = datetime.now(timezone.utc)
+    cutoff_utc = now_utc.replace(hour=0, minute=30, second=0, microsecond=0)
+    if now_utc < cutoff_utc:
+        return f"📊 **BTC Daily Brief** — {today_str} WIB\n\n⏳ Brief not yet available. It runs at 00:30 UTC (08:30 WIB).\nPlease check back after that time.", None
+
+    print(f"[BTC] No brief for {today_str}, auto-generating...")
+    brief = generate_btc_brief()
+    if brief:
+        return format_btc_brief_message(brief), brief
+    return "❌ Failed to generate BTC brief. Check logs.", None
 
 
 def parse_limit_command(text):
@@ -1839,6 +1884,18 @@ def check_telegram_commands(conn):
                         send_telegram_plain("Error generating perps stats. Check logs.")
                     review_sent = True
                 LAST_TG_UPDATE_ID = update["update_id"]
+            elif text == "/btc":
+                if not review_sent:
+                    print("[TG] /btc received, fetching brief...")
+                    try:
+                        msg, _ = get_btc_brief_today()
+                        send_telegram(msg)
+                        print("[TG] BTC brief sent")
+                    except Exception as e:
+                        print(f"[TG] BTC brief failed: {e}")
+                        send_telegram_plain("Error fetching BTC brief. Check logs.")
+                    review_sent = True
+                LAST_TG_UPDATE_ID = update["update_id"]
             elif text == "/review":
                 if not review_sent:
                     print("[TG] /review received, generating report...")
@@ -1944,6 +2001,15 @@ def listen_commands():
                     except Exception as e:
                         print(f"[TG] Perps stats error: {e}")
                         send_telegram_plain(f"Error: {e}")
+                elif text == "/btc":
+                    print("[TG] /btc received")
+                    try:
+                        msg, _ = get_btc_brief_today()
+                        send_telegram(msg)
+                        print("[TG] BTC brief sent")
+                    except Exception as e:
+                        print(f"[TG] BTC brief error: {e}")
+                        send_telegram_plain(f"Error: {e}")
                 elif text == "/review":
                     print("[TG] /review received")
                     try:
@@ -1954,7 +2020,7 @@ def listen_commands():
                         print(f"[TG] Review error: {e}")
                         send_telegram_plain(f"Error: {e}")
                 elif text == "/help":
-                    send_telegram_plain("Commands:\n/review - Signal tracker performance report\n/limit - Set trade limit (e.g. /limit short BTC 81000 invalid 81400 sl 81500 tp1 79000 tp2 78000)\n/perps - Monthly perps trade stats")
+                    send_telegram_plain("Commands:\n/btc - Today's BTC bias brief\n/review - Signal tracker performance report\n/limit - Set trade limit (e.g. /limit short BTC 81000 invalid 81400 sl 81500 tp1 79000 tp2 78000)\n/perps - Monthly perps trade stats")
 
                 LAST_TG_UPDATE_ID = update["update_id"]
                 if LAST_TG_UPDATE_ID > stored_id:
