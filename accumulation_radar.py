@@ -56,66 +56,35 @@ VOL_BREAKOUT_MULT = 3.0       # Daily volume > 3x average = breakout
 BLOCKED_ALERT_SENT = False
 LAST_API_FAILURES = {}
 
-# Journal config
-_default_journal_dir = Path(__file__).parent / "data" / "journal"
+# BTC brief journal config (for storing daily BTC analysis history)
+_default_btc_journal_dir = Path(__file__).parent / "data" / "btc_journal"
 if DB_PATH.is_absolute() and str(DB_PATH).startswith("/data/"):
-    _default_journal_dir = DB_PATH.parent / "journal"
-JOURNAL_DIR = Path(os.getenv("JOURNAL_DIR", str(_default_journal_dir)))
-
-_default_spot_journal_dir = Path(__file__).parent / "data" / "spot_journal"
-if DB_PATH.is_absolute() and str(DB_PATH).startswith("/data/"):
-    _default_spot_journal_dir = DB_PATH.parent / "spot_journal"
-SPOT_JOURNAL_DIR = Path(os.getenv("SPOT_JOURNAL_DIR", str(_default_spot_journal_dir)))
+    _default_btc_journal_dir = DB_PATH.parent / "btc_journal"
+BTC_JOURNAL_DIR = Path(os.getenv("BTC_JOURNAL_DIR", str(_default_btc_journal_dir)))
 
 
-def ensure_journal_dir():
-    """Ensure journal directory exists."""
-    JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+def ensure_btc_journal_dir():
+    """Ensure BTC journal directory exists."""
+    BTC_JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_journal(month_str):
-    """Load journal JSON for a given month (YYYY-MM)."""
-    ensure_journal_dir()
-    path = JOURNAL_DIR / f"{month_str}.json"
+    """Load BTC brief journal JSON for a given month (YYYY-MM)."""
+    ensure_btc_journal_dir()
+    path = BTC_JOURNAL_DIR / f"{month_str}.json"
     if path.exists():
         try:
             with open(path) as f:
                 return json.load(f)
         except (json.JSONDecodeError, IOError):
-            return {"month": month_str, "btc_briefs": [], "trades": []}
-    return {"month": month_str, "btc_briefs": [], "trades": []}
+            return {"month": month_str, "btc_briefs": []}
+    return {"month": month_str, "btc_briefs": []}
 
 
 def save_journal(month_str, data):
-    """Save journal JSON for a given month."""
-    ensure_journal_dir()
-    path = JOURNAL_DIR / f"{month_str}.json"
-    with open(path, "w") as f:
-        json.dump(data, f, indent=2, default=str)
-
-
-def ensure_spot_journal_dir():
-    """Ensure spot journal directory exists."""
-    SPOT_JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def load_spot_journal(month_str):
-    """Load spot journal JSON for a given month (YYYY-MM)."""
-    ensure_spot_journal_dir()
-    path = SPOT_JOURNAL_DIR / f"{month_str}.json"
-    if path.exists():
-        try:
-            with open(path) as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError):
-            return {"month": month_str, "trades": []}
-    return {"month": month_str, "trades": []}
-
-
-def save_spot_journal(month_str, data):
-    """Save spot journal JSON for a given month."""
-    ensure_spot_journal_dir()
-    path = SPOT_JOURNAL_DIR / f"{month_str}.json"
+    """Save BTC brief journal JSON for a given month."""
+    ensure_btc_journal_dir()
+    path = BTC_JOURNAL_DIR / f"{month_str}.json"
     with open(path, "w") as f:
         json.dump(data, f, indent=2, default=str)
 
@@ -231,6 +200,48 @@ def init_db():
         key TEXT PRIMARY KEY,
         value TEXT
     )""")
+
+    # v2 upgrade: hourly snapshot history for delta computation
+    c.execute("""CREATE TABLE IF NOT EXISTS hourly_token_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        price REAL,
+        price_24h_change_pct REAL,
+        open_interest REAL,
+        oi_change_pct_from_baseline REAL,
+        funding_rate REAL,
+        volume_24h REAL,
+        quote_volume_24h REAL,
+        pool_setup_state TEXT,
+        breakout_state TEXT,
+        trade_state TEXT,
+        action TEXT,
+        origin_strategies TEXT,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    )""")
+    c.execute("""CREATE INDEX IF NOT EXISTS idx_snapshot_symbol_time
+        ON hourly_token_snapshots(symbol, timestamp DESC)""")
+
+    # v2 upgrade: idempotent ALTER TABLE migrations
+    migrations = [
+        ("watchlist", "range_position_pct REAL"),
+        ("watchlist", "distance_to_high_pct REAL"),
+        ("watchlist", "breakout_state TEXT"),
+        ("watchlist", "pool_setup_state TEXT"),
+        ("watchlist", "pool_quality_score REAL"),
+        ("watchlist", "entry_readiness_score REAL"),
+        ("watchlist", "vol_breakout REAL"),
+        ("signal_tracker", "trade_state TEXT"),
+        ("signal_tracker", "origin_pool_setup_state TEXT"),
+        ("signal_tracker", "action_label TEXT"),
+    ]
+    for table, col_def in migrations:
+        try:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col_def}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     conn.commit()
     return conn
 
@@ -247,6 +258,463 @@ def set_app_state(conn, key, value):
     conn.commit()
 
 
+# v2: in-session cache for 1h klines (avoid duplicate API calls during one OI scan)
+_KLINE_1H_CACHE = {}
+
+
+def get_recent_1h_klines(symbol, limit=24):
+    """Fetch recent 1h klines for a symbol, cached per session."""
+    cache_key = (symbol, limit)
+    if cache_key in _KLINE_1H_CACHE:
+        return _KLINE_1H_CACHE[cache_key]
+    klines = api_get("/fapi/v1/klines", {"symbol": symbol, "interval": "1h", "limit": limit})
+    if klines:
+        _KLINE_1H_CACHE[cache_key] = klines
+    return klines or []
+
+
+def save_hourly_snapshot(conn, snapshot):
+    """Insert one snapshot row into hourly_token_snapshots.
+
+    snapshot keys: symbol, timestamp (ISO), price, price_24h_change_pct,
+    open_interest, oi_change_pct_from_baseline, funding_rate, volume_24h,
+    quote_volume_24h, pool_setup_state, breakout_state, trade_state, action,
+    origin_strategies (list -> JSON string).
+    """
+    c = conn.cursor()
+    origin = snapshot.get("origin_strategies") or []
+    if isinstance(origin, list):
+        origin_str = json.dumps(origin)
+    else:
+        origin_str = str(origin)
+    c.execute(
+        """INSERT INTO hourly_token_snapshots
+            (symbol, timestamp, price, price_24h_change_pct, open_interest,
+             oi_change_pct_from_baseline, funding_rate, volume_24h, quote_volume_24h,
+             pool_setup_state, breakout_state, trade_state, action, origin_strategies)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (snapshot.get("symbol"), snapshot.get("timestamp"),
+         snapshot.get("price"), snapshot.get("price_24h_change_pct"),
+         snapshot.get("open_interest"), snapshot.get("oi_change_pct_from_baseline"),
+         snapshot.get("funding_rate"), snapshot.get("volume_24h"),
+         snapshot.get("quote_volume_24h"),
+         snapshot.get("pool_setup_state"), snapshot.get("breakout_state"),
+         snapshot.get("trade_state"), snapshot.get("action"), origin_str),
+    )
+    conn.commit()
+
+
+def get_prior_snapshot(conn, symbol, hours_ago):
+    """Return the snapshot row roughly `hours_ago` hours before now.
+
+    Looks for a snapshot in a tolerance window centered on (now - hours_ago):
+      - 1h delta: window ±20 min around 1h ago  → [now-80m, now-40m]
+      - 3h delta: window ±20 min around 3h ago  → [now-200m, now-160m]
+    Returns the row as a dict, or None if no match.
+    """
+    now = datetime.now(timezone.utc)
+    target = now - timedelta(hours=hours_ago)
+    tolerance = timedelta(minutes=20)
+    win_start = (target - tolerance).strftime("%Y-%m-%dT%H:%M:%S")
+    win_end = (target + tolerance).strftime("%Y-%m-%dT%H:%M:%S")
+
+    c = conn.cursor()
+    c.row_factory = sqlite3.Row
+    row = c.execute(
+        """SELECT * FROM hourly_token_snapshots
+           WHERE symbol = ? AND timestamp BETWEEN ? AND ?
+           ORDER BY ABS(julianday(timestamp) - julianday(?)) ASC
+           LIMIT 1""",
+        (symbol, win_start, win_end, target.strftime("%Y-%m-%dT%H:%M:%S")),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def prune_old_snapshots(conn, days_to_keep=7):
+    """Delete snapshots older than N days to bound DB size."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days_to_keep)).strftime("%Y-%m-%dT%H:%M:%S")
+    c = conn.cursor()
+    c.execute("DELETE FROM hourly_token_snapshots WHERE timestamp < ?", (cutoff,))
+    conn.commit()
+
+
+# v2: lifecycle (trade_state) classification
+ACTION_MAP = {
+    "READY_LONG":          "Prepare entry. Wait for close breakout or retest.",
+    "TRIGGERED_LONG":      "Entry allowed with risk management.",
+    "ACTIVE_TREND":        "Hold/manage. New entry only on pullback/retest.",
+    "LATE_LONG":           "NO CHASE. Retest only. Reduce priority.",
+    "READY_SHORT":         "Wait for lower low or failed reclaim.",
+    "TRIGGERED_SHORT":     "Short allowed. Stop above failed reclaim.",
+    "LATE_SHORT":          "Do not chase short. Wait bounce/retest.",
+    "EARLY_UNDERFLOW":     "Alert only. Wait for OI acceleration + price breakout.",
+    "NO_CONFIRMATION":     "Deprioritize / watch only.",
+    "SHORT_COVERING_ONLY": "No fresh long unless OI turns positive again.",
+    "DISTRIBUTION_RISK":   "Avoid new long. Watch reversal or exit if long.",
+    "EXIT_WARNING":        "Take profit / tighten stop. No new long.",
+    "INVALIDATED":         "Skip. Setup invalidated.",
+}
+
+RISK_NOTES = {
+    "READY_LONG":          ["Avoid market chase if candle already extended.",
+                            "Stop below retest low / range reclaim level."],
+    "TRIGGERED_LONG":      ["Stop below retest low or range reclaim.",
+                            "Reduce size if 24h move already > 50%."],
+    "ACTIVE_TREND":        ["Trail stop under last higher-low.",
+                            "Do not market chase. Wait pullback."],
+    "LATE_LONG":           ["No new long.",
+                            "Only retest scalp with smaller size.",
+                            "Watch OI rising while price stalls = long trap."],
+    "READY_SHORT":         ["Wait for lower low / failed reclaim.",
+                            "Avoid short if already dumped >20% in 24h."],
+    "TRIGGERED_SHORT":     ["Stop above failed reclaim / recent swing high.",
+                            "Skip if 24h move already < -20%."],
+    "LATE_SHORT":          ["Do not chase. Wait bounce/retest."],
+    "EARLY_UNDERFLOW":     ["Position not active. Watch OI acceleration."],
+    "DISTRIBUTION_RISK":   ["OI up + price stalling after big move = potential long trap.",
+                            "Reduce exposure if long."],
+    "EXIT_WARNING":        ["Take profit / tighten stop.",
+                            "No new long."],
+    "SHORT_COVERING_ONLY": ["Price up + OI down = covering, not fresh trend.",
+                            "Wait for OI to turn positive again."],
+    "NO_CONFIRMATION":     ["No futures confirmation yet. Watch only."],
+    "INVALIDATED":         ["Setup invalidated. Skip."],
+}
+
+
+def detect_breakout_confirmation(symbol, range_high):
+    """True iff last 2 hourly closes are above range_high."""
+    if range_high is None or range_high <= 0:
+        return False
+    klines = get_recent_1h_klines(symbol, limit=4)
+    if not klines or len(klines) < 2:
+        return False
+    closes = [float(k[4]) for k in klines[-2:]]
+    return all(c > range_high for c in closes)
+
+
+def detect_breakdown_confirmation(symbol, range_low):
+    """True iff last 2 hourly closes are below range_low."""
+    if range_low is None or range_low <= 0:
+        return False
+    klines = get_recent_1h_klines(symbol, limit=4)
+    if not klines or len(klines) < 2:
+        return False
+    closes = [float(k[4]) for k in klines[-2:]]
+    return all(c < range_low for c in closes)
+
+
+def detect_failed_reclaim(symbol, range_low):
+    """After a breakdown, did price try to reclaim range_low but fail?
+    Heuristic: in last 6h, the highest wick reached above range_low but the
+    most recent close is back below it."""
+    if range_low is None or range_low <= 0:
+        return False
+    klines = get_recent_1h_klines(symbol, limit=6)
+    if not klines or len(klines) < 3:
+        return False
+    highs = [float(k[2]) for k in klines]
+    last_close = float(klines[-1][4])
+    return any(h > range_low for h in highs) and last_close < range_low
+
+
+def classify_trade_state(coin_data, prior_1h, prior_3h, pool_row):
+    """Lifecycle classification — returns dict with trade_state, action, transition,
+    deltas, and the helper booleans used (for transparency in output).
+
+    coin_data: dict with current `price`, `oi_usd`, `fr_pct`, `px_chg` (24h %),
+               `sym` (symbol).
+    prior_1h, prior_3h: rows from hourly_token_snapshots (or None).
+    pool_row: matching watchlist row dict (or None) for range_high/low/breakout_state.
+    """
+    current_price = coin_data.get("price") or 0
+    current_oi = coin_data.get("oi_usd") or 0
+    current_funding = coin_data.get("fr_pct", 0) / 100.0 if coin_data.get("fr_pct") is not None else 0
+    price_24h = coin_data.get("px_chg")  # already 24h %
+
+    # ---- delta computations ----
+    def pct_delta(curr, prev):
+        if prev is None or prev == 0 or curr is None:
+            return None
+        return ((curr - prev) / prev) * 100
+
+    price_1h = pct_delta(current_price, prior_1h.get("price") if prior_1h else None)
+    oi_1h = pct_delta(current_oi, prior_1h.get("open_interest") if prior_1h else None)
+    fund_1h = None
+    if prior_1h and prior_1h.get("funding_rate") is not None:
+        fund_1h = current_funding - prior_1h["funding_rate"]
+    price_3h = pct_delta(current_price, prior_3h.get("price") if prior_3h else None)
+    oi_3h = pct_delta(current_oi, prior_3h.get("open_interest") if prior_3h else None)
+
+    # ---- pool context ----
+    breakout_state = (pool_row or {}).get("breakout_state")
+    pool_setup_state = (pool_row or {}).get("pool_setup_state")
+    range_high = (pool_row or {}).get("high_price")
+    range_low = (pool_row or {}).get("low_price")
+    distance_to_high_pct = (pool_row or {}).get("distance_to_high_pct")
+    vol_breakout = (pool_row or {}).get("vol_breakout")
+    avg_vol = (pool_row or {}).get("avg_vol")
+
+    price_from_breakout_pct = None
+    if range_high and range_high > 0 and current_price > range_high:
+        price_from_breakout_pct = ((current_price - range_high) / range_high) * 100
+
+    is_extended = (
+        breakout_state == "EXTENDED_BREAKOUT"
+        or (price_24h is not None and price_24h > 100)
+    )
+    near_resistance = (
+        distance_to_high_pct is not None and distance_to_high_pct < 10
+        and breakout_state in ("INSIDE_RANGE_HIGH", "BREAKOUT_ZONE")
+    )
+
+    volume_confirmed = False
+    if avg_vol and avg_vol > 0:
+        cur_vol = coin_data.get("vol", 0)
+        # vol_breakout is 7d/avg ratio from pool. For OI-mode we approximate via 24h vol.
+        volume_confirmed = cur_vol >= 3 * avg_vol or (vol_breakout or 0) >= 3
+
+    sym = coin_data.get("sym")
+    breakout_confirmed = False
+    breakdown_confirmed = False
+    failed_reclaim = False
+    if sym and range_high:
+        breakout_confirmed = detect_breakout_confirmation(sym, range_high)
+    if sym and range_low:
+        breakdown_confirmed = detect_breakdown_confirmation(sym, range_low)
+        if breakdown_confirmed:
+            failed_reclaim = detect_failed_reclaim(sym, range_low)
+
+    # ---- classification (priority order — first match wins) ----
+    def safe_abs(x):
+        return abs(x) if x is not None else 0
+
+    trade_state = "NO_CONFIRMATION"
+
+    # 1. LATE_LONG — extended pump
+    if (
+        (price_24h is not None and price_24h > 100)
+        or (price_from_breakout_pct is not None and price_from_breakout_pct > 30)
+        or breakout_state == "EXTENDED_BREAKOUT"
+    ):
+        trade_state = "LATE_LONG"
+    # 2. EXIT_WARNING — big move + OI bleeding
+    elif (price_24h is not None and price_24h > 30
+          and oi_1h is not None and oi_1h < -10):
+        trade_state = "EXIT_WARNING"
+    # 3. DISTRIBUTION_RISK — stalled price after move, OI still rising
+    elif (price_1h is not None and price_1h <= 0
+          and oi_1h is not None and oi_1h > 10
+          and price_24h is not None and price_24h > 30):
+        trade_state = "DISTRIBUTION_RISK"
+    # 4. LATE_SHORT — already dumped
+    elif price_24h is not None and price_24h < -20:
+        trade_state = "LATE_SHORT"
+    # 5. TRIGGERED_SHORT
+    elif (breakdown_confirmed and failed_reclaim
+          and oi_1h is not None and oi_1h > 10):
+        trade_state = "TRIGGERED_SHORT"
+    # 6. READY_SHORT
+    elif (oi_1h is not None and oi_1h > 10
+          and price_1h is not None and price_1h < -2
+          and current_funding >= 0):
+        trade_state = "READY_SHORT"
+    # 7. ACTIVE_TREND
+    elif (price_3h is not None and price_3h > 20
+          and oi_3h is not None and oi_3h > 30
+          and current_funding < 0):
+        trade_state = "ACTIVE_TREND"
+    # 8. TRIGGERED_LONG
+    elif (breakout_confirmed
+          and oi_1h is not None and oi_1h >= 15
+          and volume_confirmed
+          and not is_extended):
+        trade_state = "TRIGGERED_LONG"
+    # 9. READY_LONG
+    elif (oi_1h is not None and oi_1h >= 15
+          and price_1h is not None and price_1h > 0
+          and near_resistance
+          and not is_extended):
+        trade_state = "READY_LONG"
+    # 10. SHORT_COVERING_ONLY
+    elif (price_1h is not None and price_1h > 0
+          and oi_1h is not None and oi_1h < 0):
+        trade_state = "SHORT_COVERING_ONLY"
+    # 11. EARLY_UNDERFLOW
+    elif (oi_1h is not None and 3 <= oi_1h < 15
+          and safe_abs(price_1h) < 3):
+        trade_state = "EARLY_UNDERFLOW"
+    # 12. NO_CONFIRMATION (fallback)
+    elif (oi_1h is not None and oi_1h <= 0
+          and safe_abs(price_1h) < 3):
+        trade_state = "NO_CONFIRMATION"
+
+    # ---- transition chain ----
+    prior_3h_state = (prior_3h or {}).get("trade_state") or "UNKNOWN"
+    prior_1h_state = (prior_1h or {}).get("trade_state") or "UNKNOWN"
+    if prior_1h is None and prior_3h is None:
+        transition = f"UNKNOWN → {trade_state}"
+    elif prior_3h_state == prior_1h_state and prior_3h_state != "UNKNOWN":
+        transition = f"{prior_1h_state} → {trade_state}"
+    else:
+        transition = f"{prior_3h_state} → {prior_1h_state} → {trade_state}"
+
+    return {
+        "trade_state": trade_state,
+        "action": ACTION_MAP.get(trade_state, ""),
+        "risk_notes": RISK_NOTES.get(trade_state, []),
+        "transition": transition,
+        "price_1h_change_pct": price_1h,
+        "oi_1h_change_pct": oi_1h,
+        "funding_1h_change": fund_1h,
+        "price_3h_change_pct": price_3h,
+        "oi_3h_change_pct": oi_3h,
+        "price_from_breakout_pct": price_from_breakout_pct,
+        "is_extended": is_extended,
+        "near_resistance": near_resistance,
+        "volume_confirmed": volume_confirmed,
+        "breakout_confirmed": breakout_confirmed,
+        "breakdown_confirmed": breakdown_confirmed,
+        "failed_reclaim": failed_reclaim,
+        "origin_pool_setup_state": pool_setup_state,
+    }
+
+
+# v2: bucket mapping for hourly output
+LIFECYCLE_BUCKETS = {
+    "ACTIONABLE": {"READY_LONG", "TRIGGERED_LONG", "READY_SHORT", "TRIGGERED_SHORT"},
+    "ALERT":      {"EARLY_UNDERFLOW"},
+    "ACTIVE_LATE": {"ACTIVE_TREND", "LATE_LONG", "LATE_SHORT"},
+    "AVOID":      {"NO_CONFIRMATION", "SHORT_COVERING_ONLY", "DISTRIBUTION_RISK",
+                   "EXIT_WARNING", "INVALIDATED"},
+}
+
+
+# v2.1: compact display maps for 2-line Telegram output
+POOL_STATE_VISUAL = {
+    # state → (status_emoji, action_emoji, short_hint)
+    "PRICE_BREAKOUT_CONFIRMED": ("🟢", "🚀", "retest watch"),
+    "ARMED_INSIDE_RANGE":       ("🟠", "💪", "wait BO + OI accel"),
+    "WAKING_UP":                ("🟡", "🌅", "watch OI + resistance"),
+    "EXTENDED_BREAKOUT":        ("⚠️", "🔥", "no chase, retest only"),
+    "SLEEPING_ACCUMULATION":    ("💤", "😴", "still monitoring"),
+    "INVALID_RANGE":            ("⚪", "❓", "invalid range data"),
+}
+
+TRADE_STATE_EMOJI = {
+    "READY_LONG": "🟢", "TRIGGERED_LONG": "🟢",
+    "ACTIVE_TREND": "🔥", "LATE_LONG": "🔥",
+    "READY_SHORT": "🔻", "TRIGGERED_SHORT": "🔻", "LATE_SHORT": "🔻",
+    "EARLY_UNDERFLOW": "🟠",
+    "NO_CONFIRMATION": "⚪",
+    "SHORT_COVERING_ONLY": "⚠️", "DISTRIBUTION_RISK": "⚠️", "EXIT_WARNING": "⚠️",
+    "INVALIDATED": "⛔",
+}
+
+# Short forms untuk transition chain (line 2) — pakai `-` bukan `_` agar tidak break Markdown italic
+TRADE_STATE_ABBREV = {
+    "READY_LONG": "READY", "TRIGGERED_LONG": "TRIGGER",
+    "ACTIVE_TREND": "ACTIVE", "LATE_LONG": "LATE",
+    "READY_SHORT": "RDY-SH", "TRIGGERED_SHORT": "TRIG-SH", "LATE_SHORT": "LATE-SH",
+    "EARLY_UNDERFLOW": "UNDERFLOW",
+    "NO_CONFIRMATION": "NO-CONF",
+    "SHORT_COVERING_ONLY": "COVER", "DISTRIBUTION_RISK": "DIST-RISK",
+    "EXIT_WARNING": "EXIT", "INVALIDATED": "INVALID",
+    # pool states yang muncul di chain (sebagai origin_pool_setup_state pertama)
+    "ARMED_INSIDE_RANGE": "ARMED", "WAKING_UP": "WAKING",
+    "PRICE_BREAKOUT_CONFIRMED": "BREAKOUT",
+    "EXTENDED_BREAKOUT": "EXT-BO", "SLEEPING_ACCUMULATION": "SLEEP",
+    "UNKNOWN": "UNK",
+}
+
+ACTION_COMPACT = {
+    "READY_LONG":          "🎯 Wait BO/retest",
+    "TRIGGERED_LONG":      "🎯 Entry, stop below retest",
+    "ACTIVE_TREND":        "🎯 Hold, retest only",
+    "LATE_LONG":           "⛔ NO CHASE, retest only",
+    "READY_SHORT":         "🎯 Wait lower low",
+    "TRIGGERED_SHORT":     "🎯 Short, stop above reclaim",
+    "LATE_SHORT":          "⛔ NO chase, wait bounce",
+    "EARLY_UNDERFLOW":     "🎯 Wait OI accel + BO",
+    "NO_CONFIRMATION":     "Watch only",
+    "SHORT_COVERING_ONLY": "⛔ No long, wait OI flip",
+    "DISTRIBUTION_RISK":   "⛔ Avoid long, watch reversal",
+    "EXIT_WARNING":        "⛔ TP / tighten stop",
+    "INVALIDATED":         "⛔ Skip",
+}
+
+ORIGIN_SHORT = {
+    "momentum_chase": "momentum",
+    "combined":       "combined",
+    "ambush":         "ambush",
+    "reversal":       "reversal",
+    "heat":           "heat",
+}
+
+
+def _abbrev_transition(transition_str):
+    """Convert 'ARMED_INSIDE_RANGE → READY_LONG → TRIGGERED_LONG'
+    to 'ARMED→READY→TRIGGER' using TRADE_STATE_ABBREV."""
+    if not transition_str:
+        return "UNK"
+    parts = [p.strip() for p in transition_str.split("→")]
+    return "→".join(TRADE_STATE_ABBREV.get(p, p) for p in parts)
+
+
+def _price_arrow(pct):
+    if pct is None:
+        return "➡️"
+    if pct >= 0.5:
+        return "📈"
+    if pct <= -0.5:
+        return "📉"
+    return "➡️"
+
+
+def _funding_icon(funding_rate_pct):
+    """🧊 jika negative, 💸 jika positive/zero."""
+    return "🧊" if (funding_rate_pct or 0) < 0 else "💸"
+
+
+def _delta_arrow(price_delta, oi_delta):
+    """Arrow ringkas untuk pasangan delta 1h."""
+    if price_delta is None or oi_delta is None:
+        return "↔"
+    if price_delta >= 0 and oi_delta >= 0:
+        return "↗"
+    if price_delta <= 0 and oi_delta <= 0:
+        return "↘"
+    return "→"
+
+
+def _fmt_delta_pair(p, o):
+    """'+5/+18' atau 'N/A' jika prior snapshot belum ada."""
+    if p is None or o is None:
+        return "N/A"
+    return f"{p:+.0f}/{o:+.0f}"
+
+
+def _short_origins(origins):
+    """List → 'momentum+combined+heat' atau '—' jika empty."""
+    if not origins:
+        return "—"
+    return "+".join(ORIGIN_SHORT.get(o, o) for o in origins)
+
+
+def _pretty_state(state):
+    """Replace underscores with spaces for display (Markdown italic-safe)."""
+    if not state:
+        return "UNKNOWN"
+    return state.replace("_", " ")
+
+
+def bucket_of(trade_state):
+    for bucket, states in LIFECYCLE_BUCKETS.items():
+        if trade_state in states:
+            return bucket
+    return "AVOID"
+
+
 def get_all_perp_symbols():
     """Fetch all USDT perpetual symbols."""
     info = api_get("/fapi/v1/exchangeInfo")
@@ -256,6 +724,114 @@ def get_all_perp_symbols():
             if s["quoteAsset"] == "USDT" 
             and s["contractType"] == "PERPETUAL"
             and s["status"] == "TRADING"]
+
+
+def compute_breakout_state(current_price, low_price, high_price):
+    """Compute (range_position_pct, distance_to_high_pct, breakout_state) from price + range.
+    Returns (None, None, 'INVALID_RANGE') for degenerate ranges."""
+    if high_price <= low_price or low_price <= 0 or current_price <= 0:
+        return None, None, "INVALID_RANGE"
+
+    range_position_pct = ((current_price - low_price) / (high_price - low_price)) * 100
+    distance_to_high_pct = ((high_price - current_price) / current_price) * 100
+
+    if range_position_pct < 25:
+        state = "INSIDE_RANGE_LOW"
+    elif range_position_pct < 60:
+        state = "INSIDE_RANGE_MID"
+    elif range_position_pct < 90:
+        state = "INSIDE_RANGE_HIGH"
+    elif range_position_pct <= 110:
+        state = "BREAKOUT_ZONE"
+    elif range_position_pct <= 125:
+        state = "BREAKOUT_CONFIRMED"
+    else:
+        state = "EXTENDED_BREAKOUT"
+
+    return range_position_pct, distance_to_high_pct, state
+
+
+def compute_pool_setup_state(vol_breakout, breakout_state):
+    """Derive pool_setup_state from volume expansion + price location in range."""
+    if breakout_state == "INVALID_RANGE":
+        return "SLEEPING_ACCUMULATION"
+    if breakout_state == "EXTENDED_BREAKOUT":
+        return "EXTENDED_BREAKOUT"
+    if breakout_state in ("BREAKOUT_ZONE", "BREAKOUT_CONFIRMED"):
+        return "PRICE_BREAKOUT_CONFIRMED"
+    # Inside range cases: drive by volume expansion
+    if vol_breakout < 1.5:
+        return "SLEEPING_ACCUMULATION"
+    if vol_breakout < 3:
+        return "WAKING_UP"
+    return "ARMED_INSIDE_RANGE"
+
+
+def calculate_late_penalty(price_24h_change_pct, price_from_breakout_pct):
+    """Negative score adjustment for tokens already extended.
+    Returns 0 or a negative integer to subtract from entry_readiness_score."""
+    penalty = 0
+    if price_24h_change_pct is not None:
+        if price_24h_change_pct > 30:
+            penalty -= 10
+        if price_24h_change_pct > 60:
+            penalty -= 20
+        if price_24h_change_pct > 100:
+            penalty -= 40
+    if price_from_breakout_pct is not None:
+        if price_from_breakout_pct > 15:
+            penalty -= 10
+        if price_from_breakout_pct > 30:
+            penalty -= 25
+    return penalty
+
+
+def compute_entry_readiness_score(breakout_state, range_position_pct, distance_to_high_pct,
+                                   vol_breakout, price_24h_change_pct=None,
+                                   price_from_breakout_pct=None, oi_1h_change_pct=None):
+    """Composite 0-100 score gauging how close to a real entry trigger.
+    Pool-mode callers pass only price/range/volume fields; OI mode tops it up with
+    oi_1h_change_pct. Late penalty is always applied."""
+    if breakout_state == "INVALID_RANGE":
+        return 0
+
+    # 1) Breakout progression — peaks in BREAKOUT_ZONE, drops back for EXTENDED
+    progression_map = {
+        "INSIDE_RANGE_LOW":     5,
+        "INSIDE_RANGE_MID":     15,
+        "INSIDE_RANGE_HIGH":    30,
+        "BREAKOUT_ZONE":        45,
+        "BREAKOUT_CONFIRMED":   35,
+        "EXTENDED_BREAKOUT":    10,
+    }
+    score = progression_map.get(breakout_state, 0)
+
+    # 2) Distance to high bonus (closer = better, only when still inside range)
+    if breakout_state.startswith("INSIDE_RANGE") and distance_to_high_pct is not None:
+        if distance_to_high_pct < 10:
+            score += 15
+        elif distance_to_high_pct < 30:
+            score += 8
+        elif distance_to_high_pct < 60:
+            score += 3
+
+    # 3) Volume breakout signal (max 25 pts at vol_x >= 3)
+    if vol_breakout:
+        score += min(vol_breakout / 3.0, 1.0) * 25
+
+    # 4) OI confirmation (optional — only fed by OI mode)
+    if oi_1h_change_pct is not None:
+        if oi_1h_change_pct >= 15:
+            score += 15
+        elif oi_1h_change_pct >= 5:
+            score += 8
+        elif oi_1h_change_pct >= 2:
+            score += 3
+
+    # 5) Late penalty (always applied)
+    score += calculate_late_penalty(price_24h_change_pct, price_from_breakout_pct)
+
+    return max(0, min(100, round(score)))
 
 
 def analyze_accumulation(symbol, klines):
@@ -378,11 +954,11 @@ def analyze_accumulation(symbol, klines):
         mcap_score = 0
     
     total_score = days_score + range_score + vol_score + breakout_score + mcap_score
-    
+
     # Flatness bonus: the closer the slope is to zero, the better
     flatness_bonus = max(0, (1 - abs(best_slope_pct) / 20)) * 5
     total_score += flatness_bonus
-    
+
     # Status label
     if vol_breakout >= VOL_BREAKOUT_MULT:
         status = "🔥Volume Breakout"
@@ -390,7 +966,33 @@ def analyze_accumulation(symbol, klines):
         status = "⚡Volume Picking Up"
     else:
         status = "💤Accumulating"
-    
+
+    # === v2: Pool quality score (fundamentals only) ===
+    pool_quality_score = round(total_score)
+
+    # === v2: Breakout state + pool setup state ===
+    current_price = data[-1]["close"]
+    range_position_pct, distance_to_high_pct, breakout_state = compute_breakout_state(
+        current_price, best_low, best_high
+    )
+    pool_setup_state = compute_pool_setup_state(vol_breakout, breakout_state)
+
+    # === v2: Entry readiness score (parsial — tanpa OI delta saat pool scan) ===
+    price_from_breakout_pct = None
+    if best_high > 0 and current_price > best_high:
+        price_from_breakout_pct = ((current_price - best_high) / best_high) * 100
+
+    # price_24h_change_pct tidak tersedia di pool scan (perlu /fapi/v1/ticker/24hr)
+    entry_readiness_score = compute_entry_readiness_score(
+        breakout_state=breakout_state,
+        range_position_pct=range_position_pct,
+        distance_to_high_pct=distance_to_high_pct,
+        vol_breakout=vol_breakout,
+        price_24h_change_pct=None,
+        price_from_breakout_pct=price_from_breakout_pct,
+        oi_1h_change_pct=None,
+    )
+
     return {
         "symbol": symbol,
         "coin": coin,
@@ -400,12 +1002,19 @@ def analyze_accumulation(symbol, klines):
         "low_price": best_low,
         "high_price": best_high,
         "avg_vol": best_avg_vol,
-        "current_price": data[-1]["close"],
+        "current_price": current_price,
         "recent_vol": recent_vol,
         "vol_breakout": vol_breakout,
         "score": total_score,
         "status": status,
         "data_days": len(data),
+        # v2 fields
+        "range_position_pct": range_position_pct,
+        "distance_to_high_pct": distance_to_high_pct,
+        "breakout_state": breakout_state,
+        "pool_setup_state": pool_setup_state,
+        "pool_quality_score": pool_quality_score,
+        "entry_readiness_score": entry_readiness_score,
     }
 
 
@@ -506,13 +1115,51 @@ def format_usd(v):
     return f"${v:.0f}"
 
 
+def _pool_watch_hint(setup_state, breakout_state, distance_to_high_pct):
+    """Per-bucket actionable hint for pool report rows."""
+    if setup_state == "WAKING_UP":
+        return "Watch: OI confirmation + price pressing resistance"
+    if setup_state == "ARMED_INSIDE_RANGE":
+        if distance_to_high_pct is not None and distance_to_high_pct < 15:
+            return "Watch: very close to range high — wait for breakout + OI"
+        return "Watch: wait for price breakout + OI acceleration"
+    if setup_state == "PRICE_BREAKOUT_CONFIRMED":
+        return "Watch: retest range high, avoid chase if extended"
+    if setup_state == "EXTENDED_BREAKOUT":
+        return "Watch: no new long. Retest only."
+    return "Watch: still sleeping — keep monitoring"
+
+
+def _format_pool_row(r):
+    """Render one token row as exactly 2 lines (compact v2.1, Opsi A)."""
+    pq = int(r.get("pool_quality_score") or round(r.get("score", 0)))
+    er = int(r.get("entry_readiness_score") or 0)
+    rp = r.get("range_position_pct")
+    dh = r.get("distance_to_high_pct")
+    ss = r.get("pool_setup_state") or "SLEEPING_ACCUMULATION"
+    sw = r.get("sideways_days", 0) or 0
+    rng = r.get("range_pct", 0) or 0
+    vol_x = r.get("vol_breakout", 0) or 0
+
+    rp_str = f"{rp:.0f}%" if rp is not None else "N/A"
+    dh_str = f"{dh:+.0f}%" if dh is not None else "N/A"
+
+    status_em, action_em, hint = POOL_STATE_VISUAL.get(ss, ("⚪", "•", ""))
+
+    return [
+        f"{status_em} **{r['coin']}** ▸ Q{pq} ER{er} ▸ "
+        f"⏱{sw}d 📏{rng:.0f}% 📊{vol_x:.1f}× ▸ 📐{rp_str} 🎯{dh_str}",
+        f"   {action_em} {_pretty_state(ss)} — {hint}",
+    ]
+
+
 def build_pool_report(results, top_n=25):
-    """Build the accumulation-pool report."""
+    """Build the accumulation-pool report grouped by pool_setup_state."""
     if not results:
         return ""
-    
+
     now = datetime.now(timezone(timedelta(hours=8)))
-    
+
     lines = [
         f"🏦 **Accumulation Radar** - Pool Update",
         f"⏰ {now.strftime('%Y-%m-%d %H:%M')} WIB",
@@ -520,46 +1167,49 @@ def build_pool_report(results, top_n=25):
         f"Scanned {len(results)} contracts. Candidates found:",
         "",
     ]
-    
-    # Groups: breakout > warming up > still accumulating
-    firing = [r for r in results if "Volume Breakout" in r["status"]]
-    warming = [r for r in results if "Volume Picking Up" in r["status"]]
-    sleeping = [r for r in results if "Accumulating" in r["status"]]
-    
-    if firing:
-        lines.append(f"🔥 **Volume Breakout** ({len(firing)}) - Highest priority")
-        for r in firing[:10]:
-            lines.append(
-                f"  🔥 **{r['coin']}** | Score:{r['score']:.0f} | "
-                f"Sideways {r['sideways_days']}d | Range {r['range_pct']:.0f}% | "
-                f"Volume {r['vol_breakout']:.1f}x"
-            )
-            lines.append(
-                f"     ${r['current_price']:.6f} | "
-                f"Range: ${r['low_price']:.6f}~${r['high_price']:.6f} | "
-                f"Avg d-vol: {format_usd(r['avg_vol'])}"
-            )
-        lines.append("")
-    
-    if warming:
-        lines.append(f"⚡ **Volume Picking Up** ({len(warming)}) - On watch")
-        for r in warming[:10]:
-            lines.append(
-                f"  ⚡ {r['coin']} | Score:{r['score']:.0f} | "
-                f"Sideways {r['sideways_days']}d | Range {r['range_pct']:.0f}% | "
-                f"Vol {r['vol_breakout']:.1f}x"
-            )
-        lines.append("")
-    
-    if sleeping:
-        lines.append(f"💤 **Accumulating** ({len(sleeping)}) - Keep monitoring")
-        for r in sleeping[:15]:
-            lines.append(
-                f"  💤 {r['coin']} | Score:{r['score']:.0f} | "
-                f"Sideways {r['sideways_days']}d | Range {r['range_pct']:.0f}% | "
-                f"Avg d-vol: {format_usd(r['avg_vol'])}"
-            )
-    
+
+    buckets = [
+        ("PRICE_BREAKOUT_CONFIRMED", "🟢", "PRICE BREAKOUT CONFIRMED", "Retest watch"),
+        ("ARMED_INSIDE_RANGE",       "🟠", "ARMED INSIDE RANGE",       "Volume anomaly but no price breakout yet"),
+        ("WAKING_UP",                "🟡", "WAKING UP",                "Early volume wake-up"),
+        ("EXTENDED_BREAKOUT",        "⚠️", "EXTENDED BREAKOUT",       "No new long, retest only"),
+        ("SLEEPING_ACCUMULATION",    "💤", "SLEEPING ACCUMULATION",    "Keep monitoring"),
+    ]
+
+    # Group and sort each bucket by entry_readiness_score desc, then pool_quality_score desc
+    grouped = {}
+    for r in results:
+        ss = r.get("pool_setup_state") or "SLEEPING_ACCUMULATION"
+        grouped.setdefault(ss, []).append(r)
+    for arr in grouped.values():
+        arr.sort(key=lambda x: (x.get("entry_readiness_score", 0),
+                                x.get("pool_quality_score", x.get("score", 0))), reverse=True)
+
+    per_bucket_limit = {
+        "PRICE_BREAKOUT_CONFIRMED": 10,
+        "ARMED_INSIDE_RANGE":       10,
+        "WAKING_UP":                10,
+        "EXTENDED_BREAKOUT":        5,
+        "SLEEPING_ACCUMULATION":    8,
+    }
+
+    any_shown = False
+    for key, emoji, label, tagline in buckets:
+        arr = grouped.get(key, [])
+        if not arr:
+            continue
+        any_shown = True
+        lines.append(f"{emoji} **{label}** ({len(arr)}) — {tagline}")
+        limit = per_bucket_limit.get(key, 10)
+        for r in arr[:limit]:
+            lines.extend(_format_pool_row(r))
+        if len(arr) > limit:
+            lines.append(f"  ... +{len(arr) - limit} more in {label}")
+        lines.append("")  # blank line antar bucket only
+
+    if not any_shown:
+        lines.append("(No candidates matched any setup state.)")
+
     return "\n".join(lines)
 
 
@@ -685,16 +1335,22 @@ def save_watchlist(conn, results):
     """Save the pool to the database."""
     c = conn.cursor()
     now = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-    
+
     for r in results:
-        c.execute("""INSERT OR REPLACE INTO watchlist 
-            (symbol, coin, added_date, sideways_days, range_pct, avg_vol, 
-             low_price, high_price, current_price, score, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        c.execute("""INSERT OR REPLACE INTO watchlist
+            (symbol, coin, added_date, sideways_days, range_pct, avg_vol,
+             low_price, high_price, current_price, score, status,
+             range_position_pct, distance_to_high_pct, breakout_state,
+             pool_setup_state, pool_quality_score, entry_readiness_score, vol_breakout)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (r["symbol"], r["coin"], now, r["sideways_days"], r["range_pct"],
              r["avg_vol"], r["low_price"], r["high_price"], r["current_price"],
-             r["score"], r["status"]))
-    
+             r["score"], r["status"],
+             r.get("range_position_pct"), r.get("distance_to_high_pct"),
+             r.get("breakout_state"), r.get("pool_setup_state"),
+             r.get("pool_quality_score"), r.get("entry_readiness_score"),
+             r.get("vol_breakout")))
+
     conn.commit()
     print(f"  💾 Saved {len(results)} symbols to the database")
 
@@ -793,8 +1449,13 @@ def build_fuel_report(fuel_targets, squeeze_targets):
     return "\n".join(lines)
 
 
-def save_signals(conn, chase, combined, ambush, reversal, coin_data, pool_map, now_str):
-    """Save top signals from each strategy to signal_tracker for performance tracking."""
+def save_signals(conn, chase, combined, ambush, reversal, coin_data, pool_map, now_str,
+                 trade_state_map=None, action_map=None, origin_pool_state_map=None):
+    """Save top signals from each strategy to signal_tracker for performance tracking.
+
+    v2: optional trade_state_map / action_map / origin_pool_state_map enrich
+    each signal with lifecycle context.
+    """
     c = conn.cursor()
     to_save = []
     seen = set()
@@ -804,10 +1465,18 @@ def save_signals(conn, chase, combined, ambush, reversal, coin_data, pool_map, n
     for row in c.fetchall():
         seen.add((row[0], row[1]))
 
+    trade_state_map = trade_state_map or {}
+    action_map = action_map or {}
+    origin_pool_state_map = origin_pool_state_map or {}
+
     def add_sig(coin, symbol, sig_type, price, score_val, rh=0, rl=0, n=""):
         key = (coin, sig_type)
         if key not in seen:
-            to_save.append((symbol, coin, sig_type, now_str, price, rh, rl, score_val, n))
+            ts = trade_state_map.get(symbol)
+            act = action_map.get(symbol)
+            origin = origin_pool_state_map.get(symbol)
+            to_save.append((symbol, coin, sig_type, now_str, price, rh, rl, score_val, n,
+                            ts, origin, act))
             seen.add(key)
 
     for s in chase[:5]:
@@ -852,8 +1521,9 @@ def save_signals(conn, chase, combined, ambush, reversal, coin_data, pool_map, n
 
     for item in to_save:
         c.execute("""INSERT INTO signal_tracker
-            (symbol, coin, signal_type, signal_time, signal_price, range_high, range_low, score, notes)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", item)
+            (symbol, coin, signal_type, signal_time, signal_price, range_high, range_low,
+             score, notes, trade_state, origin_pool_setup_state, action_label)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", item)
 
     conn.commit()
     if to_save:
@@ -947,7 +1617,8 @@ def build_tracking_recap(conn):
         if total > 0:
             rate = wins / total * 100
             emoji = "🎯" if sig_type == "underflow" else "🔥" if sig_type == "momentum_chase" else "📊" if sig_type == "combined" else "🔻" if sig_type == "reversal" else "🌟"
-            lines.append(f"  {emoji} {sig_type}: {wins}/{total} ({rate:.0f}%)")
+            display_name = sig_type.replace("_", " ")  # avoid Markdown italic break
+            lines.append(f"  {emoji} {display_name}: {wins}/{total} ({rate:.0f}%)")
 
     return "\n".join(lines)
 
@@ -1118,6 +1789,24 @@ def generate_review_report(conn):
     lines.append(f"Overall: {total_signals} signals | {total_entered} entered | {total_wins} wins | {overall_wr:.0f}% win rate")
     if overall_avg:
         lines.append(f"Avg entry P&L: {overall_avg:+.1f}%")
+
+    # v2: breakdown by trade_state
+    c.execute("""SELECT trade_state, COUNT(*),
+                 SUM(CASE WHEN status='entered' THEN 1 ELSE 0 END),
+                 SUM(CASE WHEN status='entered' AND entry_price > signal_price THEN 1 ELSE 0 END),
+                 AVG(CASE WHEN status='entered' THEN (entry_price - signal_price) / signal_price * 100 END)
+                 FROM signal_tracker
+                 WHERE trade_state IS NOT NULL
+                 GROUP BY trade_state
+                 ORDER BY COUNT(*) DESC""")
+    rows = c.fetchall()
+    if rows:
+        lines.append("")
+        lines.append("By Trade State (v2):")
+        for ts, total, entered, wins, avg_pnl in rows:
+            wr = (wins / entered * 100) if entered else 0
+            pnl_str = f"avg {avg_pnl:+.1f}%" if avg_pnl is not None else "N/A"
+            lines.append(f"  {ts}: {total} total | {entered} entered | {wr:.0f}% WR | {pnl_str}")
 
     return "\n".join(lines)
 
@@ -1427,1042 +2116,6 @@ def get_btc_brief_today():
     return "❌ Failed to generate BTC brief. Check logs.", None
 
 
-def parse_limit_command(text):
-    """Parse /limit command and return trade dict or error string.
-    Format: /limit <direction> <symbol> <entry> lev <x> invalid <price> sl <price> tp1 <price> [tp2...]"""
-    parts = text.strip().split()
-    if len(parts) < 10:
-        return "❌ Usage: /limit <long|short> <SYMBOL> <entry> lev <x> invalid <price> sl <price> tp1 <price> [tp2 <price> ...]"
-
-    direction = parts[1].lower()
-    if direction not in ("long", "short"):
-        return f"❌ Invalid direction '{direction}'. Use 'long' or 'short'."
-
-    coin = parts[2].upper()
-    symbol = f"{coin}USDT"
-
-    try:
-        entry = float(parts[3])
-    except ValueError:
-        return f"❌ Invalid entry price: {parts[3]}"
-
-    # Parse keyword-value pairs
-    keywords = {}
-    i = 4
-    while i < len(parts):
-        kw = parts[i].lower()
-        if kw in ("lev", "invalid", "sl"):
-            if i + 1 >= len(parts):
-                return f"❌ Missing value for '{kw}'"
-            keywords[kw] = parts[i + 1]
-            i += 2
-        elif kw.startswith("tp"):
-            if i + 1 >= len(parts):
-                return f"❌ Missing value for '{kw}'"
-            keywords[kw] = parts[i + 1]
-            i += 2
-        else:
-            return f"❌ Unknown keyword: {kw}. Use: lev, invalid, sl, tp1, tp2, ..."
-
-    # Validate required fields
-    if "lev" not in keywords:
-        return "❌ Missing 'lev' (leverage)."
-    if "invalid" not in keywords:
-        return "❌ Missing 'invalid' price."
-    if "sl" not in keywords:
-        return "❌ Missing 'sl' (stop loss) price."
-
-    try:
-        lev = int(float(keywords["lev"]))
-        invalid_price = float(keywords["invalid"])
-        sl_price = float(keywords["sl"])
-    except ValueError:
-        return "❌ Invalid numeric value for lev, invalid, or sl."
-    if lev <= 0:
-        return "❌ Leverage must be a positive integer."
-
-    # Parse TPs
-    targets = []
-    tp_keys = sorted([k for k in keywords if k.startswith("tp")], key=lambda x: int(x[2:]))
-    for k in tp_keys:
-        try:
-            targets.append(float(keywords[k]))
-        except ValueError:
-            return f"❌ Invalid price for {k}."
-
-    if not targets:
-        return "❌ At least one tp1 is required."
-
-    # Validate direction logic
-    if direction == "short":
-        if entry <= 0:
-            return "❌ Entry price must be positive."
-        if sl_price <= entry:
-            return f"❌ For SHORT: SL ({sl_price}) must be above entry ({entry})."
-        if invalid_price == entry:
-            return f"❌ Invalid price cannot equal entry price ({entry})."
-        if not (targets[0] <= invalid_price <= sl_price):
-            return f"❌ For SHORT: invalid ({invalid_price}) must be between TP1 ({targets[0]}) and SL ({sl_price})."
-        for tp in targets:
-            if tp >= entry:
-                return f"❌ For SHORT: TP ({tp}) must be below entry ({entry})."
-        # TPs should be sorted descending (closest to farthest)
-        if targets != sorted(targets, reverse=True):
-            return "❌ For SHORT: TP prices should be ordered from highest to lowest (tp1 closest to entry)."
-    else:  # long
-        if entry <= 0:
-            return "❌ Entry price must be positive."
-        if sl_price >= entry:
-            return f"❌ For LONG: SL ({sl_price}) must be below entry ({entry})."
-        if invalid_price == entry:
-            return f"❌ Invalid price cannot equal entry price ({entry})."
-        if not (sl_price <= invalid_price <= targets[0]):
-            return f"❌ For LONG: invalid ({invalid_price}) must be between SL ({sl_price}) and TP1 ({targets[0]})."
-        for tp in targets:
-            if tp <= entry:
-                return f"❌ For LONG: TP ({tp}) must be above entry ({entry})."
-        # TPs should be sorted ascending (closest to farthest)
-        if targets != sorted(targets):
-            return "❌ For LONG: TP prices should be ordered from lowest to highest (tp1 closest to entry)."
-
-    # Calculate risk
-    risk_r = abs(entry - sl_price)
-
-    trade = {
-        "id": "",
-        "created_at": datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00"),
-        "direction": direction,
-        "symbol": symbol,
-        "coin": coin,
-        "entry": entry,
-        "lev": lev,
-        "invalid": invalid_price,
-        "sl": sl_price,
-        "targets": targets,
-        "status": "pending",
-        "risk_r": round(risk_r, 2),
-        "tp_status": [{"price": tp, "hit": False, "hit_at": None} for tp in targets],
-        "sl_hit": False,
-        "sl_hit_at": None,
-        "entry_filled": False,
-        "entry_filled_at": None,
-        "invalidated": False,
-        "invalidated_at": None,
-        "all_tps_hit": False,
-        "last_sync": None,
-        "notes": "",
-    }
-
-    # Generate ID
-    now_wib = datetime.now(timezone(timedelta(hours=8)))
-    trade["id"] = f"{now_wib.strftime('%m-%d')}-{coin}-{int(entry)}"
-
-    return trade
-
-
-def parse_position_command(text):
-    """Parse /position command and return trade dict or error string.
-    Format: /position <long|short> <SYMBOL> <entry> lev <x> sl <price> tp1 <price> [tp2...]"""
-    parts = text.strip().split()
-    if len(parts) < 9:
-        return "❌ Usage: /position <long|short> <SYMBOL> <entry> lev <x> sl <price> tp1 <price> [tp2 <price> ...]"
-
-    direction = parts[1].lower()
-    if direction not in ("long", "short"):
-        return f"❌ Invalid direction '{direction}'. Use 'long' or 'short'."
-
-    coin = parts[2].upper()
-    symbol = f"{coin}USDT"
-
-    try:
-        entry = float(parts[3])
-    except ValueError:
-        return f"❌ Invalid entry price: {parts[3]}"
-
-    # Parse keyword-value pairs
-    keywords = {}
-    i = 4
-    while i < len(parts):
-        kw = parts[i].lower()
-        if kw in ("lev", "sl"):
-            if i + 1 >= len(parts):
-                return f"❌ Missing value for '{kw}'"
-            keywords[kw] = parts[i + 1]
-            i += 2
-        elif kw.startswith("tp"):
-            if i + 1 >= len(parts):
-                return f"❌ Missing value for '{kw}'"
-            keywords[kw] = parts[i + 1]
-            i += 2
-        elif kw == "invalid":
-            return "❌ /position does not use 'invalid'. For limit orders use /limit."
-        else:
-            return f"❌ Unknown keyword: {kw}. Use: lev, sl, tp1, tp2, ..."
-
-    if "lev" not in keywords:
-        return "❌ Missing 'lev' (leverage)."
-    if "sl" not in keywords:
-        return "❌ Missing 'sl' (stop loss) price."
-
-    try:
-        lev = int(float(keywords["lev"]))
-        sl_price = float(keywords["sl"])
-    except ValueError:
-        return "❌ Invalid numeric value for lev or sl."
-    if lev <= 0:
-        return "❌ Leverage must be a positive integer."
-
-    targets = []
-    tp_keys = sorted([k for k in keywords if k.startswith("tp")], key=lambda x: int(x[2:]))
-    for k in tp_keys:
-        try:
-            targets.append(float(keywords[k]))
-        except ValueError:
-            return f"❌ Invalid price for {k}."
-
-    if not targets:
-        return "❌ At least one tp1 is required."
-
-    # Direction validation
-    if direction == "short":
-        if entry <= 0:
-            return "❌ Entry price must be positive."
-        if sl_price <= entry:
-            return f"❌ For SHORT: SL ({sl_price}) must be above entry ({entry})."
-        for tp in targets:
-            if tp >= entry:
-                return f"❌ For SHORT: TP ({tp}) must be below entry ({entry})."
-        if targets != sorted(targets, reverse=True):
-            return "❌ For SHORT: TP prices should be ordered from highest to lowest (tp1 closest to entry)."
-    else:
-        if entry <= 0:
-            return "❌ Entry price must be positive."
-        if sl_price >= entry:
-            return f"❌ For LONG: SL ({sl_price}) must be below entry ({entry})."
-        for tp in targets:
-            if tp <= entry:
-                return f"❌ For LONG: TP ({tp}) must be above entry ({entry})."
-        if targets != sorted(targets):
-            return "❌ For LONG: TP prices should be ordered from lowest to highest (tp1 closest to entry)."
-
-    now_wib = datetime.now(timezone(timedelta(hours=8)))
-    now_str = now_wib.strftime("%Y-%m-%dT%H:%M:%S+08:00")
-    risk_r = abs(entry - sl_price)
-
-    trade = {
-        "id": f"{now_wib.strftime('%m-%d')}-{coin}-{int(entry)}",
-        "created_at": now_str,
-        "direction": direction,
-        "symbol": symbol,
-        "coin": coin,
-        "entry": entry,
-        "lev": lev,
-        "invalid": None,
-        "sl": sl_price,
-        "targets": targets,
-        "status": "active",
-        "risk_r": round(risk_r, 2),
-        "tp_status": [{"price": tp, "hit": False, "hit_at": None} for tp in targets],
-        "sl_hit": False,
-        "sl_hit_at": None,
-        "entry_filled": True,
-        "entry_filled_at": now_str,
-        "invalidated": False,
-        "invalidated_at": None,
-        "all_tps_hit": False,
-        "last_sync": now_str,
-        "notes": "",
-    }
-
-    return trade
-
-
-def process_position_command(text):
-    """Process /position command: parse, check current price, save to journal.
-    Returns (reply_message, trade_or_None)."""
-    result = parse_position_command(text)
-    if isinstance(result, str):
-        return result, None
-
-    trade = result
-    direction = trade["direction"]
-    symbol = trade["symbol"]
-
-    # Fetch current price
-    ticker = api_get("/fapi/v1/ticker/price", {"symbol": symbol})
-    if not ticker or "price" not in ticker:
-        return "⚠️ Could not fetch current price. Trade saved but price not verified.", trade
-
-    current_price = float(ticker["price"])
-    events = []
-
-    # Check SL hit
-    if direction == "short":
-        sl_hit = current_price >= trade["sl"]
-    else:
-        sl_hit = current_price <= trade["sl"]
-
-    if sl_hit:
-        trade["sl_hit"] = True
-        trade["sl_hit_at"] = trade["created_at"]
-        trade["status"] = "stopped_out"
-        events.append(f"💀 SL already hit at {trade['sl']} (current: {current_price})")
-
-    # Check TPs hit
-    if not trade["sl_hit"]:
-        for i, tp in enumerate(trade["tp_status"]):
-            if direction == "short":
-                tp_hit = current_price <= tp["price"]
-            else:
-                tp_hit = current_price >= tp["price"]
-            if tp_hit:
-                tp["hit"] = True
-                tp["hit_at"] = trade["created_at"]
-                r_achieved = abs(tp["price"] - trade["entry"]) / trade["risk_r"] if trade["risk_r"] > 0 else 0
-                events.append(f"🎯 TP{i+1} ({tp['price']}) already hit — {r_achieved:.1f}R")
-
-        if all(tp["hit"] for tp in trade["tp_status"]):
-            trade["all_tps_hit"] = True
-            trade["status"] = "completed"
-            if not any("TP" in e for e in events):
-                events.append("✅ All TPs already hit")
-
-    # Save to journal
-    add_trade_to_journal(trade)
-
-    # Build reply
-    direction_emoji = "🔴 SHORT" if direction == "short" else "🟢 LONG"
-    status_emoji = {"active": "📈", "stopped_out": "💀", "completed": "🏆"}.get(trade["status"], "")
-    tps_lines = []
-    for i, tp in enumerate(trade["tp_status"]):
-        mark = " ✅" if tp["hit"] else ""
-        r_val = abs(tp["price"] - trade["entry"]) / trade["risk_r"] if trade["risk_r"] > 0 else 0
-        tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R){mark}")
-    reply = (
-        f"{status_emoji} Position saved: {direction_emoji} {trade['coin']} @ {trade['entry']} (Lev {trade.get('lev', 1)}x)\n"
-        f"SL: {trade['sl']} | Current: {current_price}\n"
-        + "\n".join(tps_lines)
-    )
-    if events:
-        reply += "\n\n" + "\n".join(events)
-
-    return reply, trade
-
-
-def add_trade_to_journal(trade):
-    """Add a trade entry to the current month's journal."""
-    now_wib = datetime.now(timezone(timedelta(hours=8)))
-    month_str = now_wib.strftime("%Y-%m")
-    journal = load_journal(month_str)
-    journal["trades"].append(trade)
-    save_journal(month_str, journal)
-    return True
-
-
-def remove_pending_limit_trade_from_journal(trade_id, month_str=None):
-    """Remove a pending /limit trade from the current month's journal by trade id."""
-    if month_str is None:
-        now_wib = datetime.now(timezone(timedelta(hours=8)))
-        month_str = now_wib.strftime("%Y-%m")
-
-    journal = load_journal(month_str)
-    trades = journal.get("trades", [])
-
-    kept = []
-    removed = []
-    for t in trades:
-        if t.get("id") != trade_id:
-            kept.append(t)
-            continue
-
-        is_limit = t.get("invalid") is not None
-        is_pending = t.get("status") == "pending" and not t.get("entry_filled", False)
-        if is_limit and is_pending:
-            removed.append(t)
-        else:
-            kept.append(t)
-
-    if not removed:
-        return False, "❌ Tidak bisa delete: id tidak ditemukan, atau setup bukan pending /limit."
-
-    journal["trades"] = kept
-    save_journal(month_str, journal)
-    return True, f"🗑️ Deleted {len(removed)} pending /limit setup: {trade_id}"
-
-
-def _month_candidates_for_lookup():
-    now_wib = datetime.now(timezone(timedelta(hours=8)))
-    cur = now_wib.strftime("%Y-%m")
-    prev = (now_wib.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
-    return [cur] if prev == cur else [cur, prev]
-
-
-def _available_months_in_dir(dir_path):
-    try:
-        base = Path(dir_path)
-        if not base.exists():
-            return []
-        months = []
-        for p in base.glob("*.json"):
-            stem = p.stem
-            if len(stem) == 7 and stem[4] == "-" and stem[:4].isdigit() and stem[5:].isdigit():
-                months.append(stem)
-        return sorted(set(months), reverse=True)
-    except Exception:
-        return []
-
-
-def _validate_entry_change_perps(trade, new_entry):
-    if new_entry <= 0:
-        return "❌ Entry price must be positive."
-
-    direction = trade.get("direction", "").lower()
-    if direction not in ("long", "short"):
-        return "❌ Invalid trade direction."
-
-    sl = float(trade.get("sl", 0))
-    targets = trade.get("targets") or [tp.get("price") for tp in trade.get("tp_status", [])]
-    targets = [float(x) for x in targets if x is not None]
-    if not targets:
-        return "❌ Trade has no targets."
-
-    invalid = trade.get("invalid", None)
-    if invalid is not None:
-        invalid = float(invalid)
-        if invalid == new_entry:
-            return "❌ Invalid price cannot equal entry price."
-        if direction == "short":
-            tp1 = max(targets)
-            if not (tp1 <= invalid <= sl):
-                return "❌ Invalid price must be between TP1 and SL."
-        else:
-            tp1 = min(targets)
-            if not (sl <= invalid <= tp1):
-                return "❌ Invalid price must be between SL and TP1."
-
-    if direction == "short":
-        if sl <= new_entry:
-            return f"❌ For SHORT: SL ({sl}) must be above entry ({new_entry})."
-        for tp in targets:
-            if tp >= new_entry:
-                return f"❌ For SHORT: TP ({tp}) must be below entry ({new_entry})."
-    else:
-        if sl >= new_entry:
-            return f"❌ For LONG: SL ({sl}) must be below entry ({new_entry})."
-        for tp in targets:
-            if tp <= new_entry:
-                return f"❌ For LONG: TP ({tp}) must be above entry ({new_entry})."
-
-    return None
-
-
-def adjust_perps_trade_entry(trade_id, new_entry):
-    month_candidates = list(_month_candidates_for_lookup())
-    for m in _available_months_in_dir(JOURNAL_DIR):
-        if m not in month_candidates:
-            month_candidates.append(m)
-        if len(month_candidates) >= 24:
-            break
-
-    for month_str in month_candidates:
-        journal = load_journal(month_str)
-        trades = journal.get("trades", [])
-
-        match_idx = None
-        for idx in range(len(trades) - 1, -1, -1):
-            if trades[idx].get("id") == trade_id:
-                match_idx = idx
-                break
-        if match_idx is None:
-            continue
-
-        trade = trades[match_idx]
-        if trade.get("status") in ("completed", "stopped_out", "invalidated"):
-            return False, "❌ Tidak bisa adjust: trade sudah selesai."
-
-        err = _validate_entry_change_perps(trade, new_entry)
-        if err:
-            return False, err
-
-        old_entry = float(trade.get("entry", 0))
-        trade["entry"] = float(new_entry)
-        trade["risk_r"] = round(abs(trade["entry"] - float(trade.get("sl", 0))), 2)
-        trade["entry_adjusted_at"] = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
-        trades[match_idx] = trade
-        journal["trades"] = trades
-        save_journal(month_str, journal)
-
-        return True, f"✅ PERPS entry adjusted: {trade_id}\n{trade.get('coin','??')} {trade.get('direction','').upper()} | {old_entry} → {trade['entry']}"
-
-    return False, "❌ Trade ID tidak ditemukan di perps journal (bulan ini/kemarin)."
-
-
-def _validate_entry_change_spot(trade, new_entry):
-    if new_entry <= 0:
-        return "❌ Entry price must be positive."
-
-    sl = float(trade.get("sl", 0))
-    targets = trade.get("targets") or [tp.get("price") for tp in trade.get("tp_status", [])]
-    targets = [float(x) for x in targets if x is not None]
-    if not targets:
-        return "❌ Trade has no targets."
-
-    if sl >= new_entry:
-        return f"❌ For SPOT LONG: SL ({sl}) must be below entry ({new_entry})."
-    for tp in targets:
-        if tp <= new_entry:
-            return f"❌ For SPOT LONG: TP ({tp}) must be above entry ({new_entry})."
-    return None
-
-
-def adjust_spot_trade_entry(trade_id, new_entry):
-    month_candidates = list(_month_candidates_for_lookup())
-    for m in _available_months_in_dir(SPOT_JOURNAL_DIR):
-        if m not in month_candidates:
-            month_candidates.append(m)
-        if len(month_candidates) >= 24:
-            break
-
-    for month_str in month_candidates:
-        journal = load_spot_journal(month_str)
-        trades = journal.get("trades", [])
-
-        match_idx = None
-        for idx in range(len(trades) - 1, -1, -1):
-            if trades[idx].get("id") == trade_id:
-                match_idx = idx
-                break
-        if match_idx is None:
-            continue
-
-        trade = trades[match_idx]
-        if trade.get("status") in ("completed", "stopped_out"):
-            return False, "❌ Tidak bisa adjust: trade sudah selesai."
-
-        err = _validate_entry_change_spot(trade, new_entry)
-        if err:
-            return False, err
-
-        old_entry = float(trade.get("entry", 0))
-        trade["entry"] = float(new_entry)
-        trade["risk_r"] = round(abs(trade["entry"] - float(trade.get("sl", 0))), 2)
-        trade["entry_adjusted_at"] = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
-        trades[match_idx] = trade
-        journal["trades"] = trades
-        save_spot_journal(month_str, journal)
-
-        return True, f"✅ SPOT entry adjusted: {trade_id}\n{trade.get('coin','??')} | {old_entry} → {trade['entry']}"
-
-    return False, "❌ Trade ID tidak ditemukan di spot journal."
-
-
-def parse_spot_command(text):
-    """Parse /spot command and return trade dict or error string.
-    Format: /spot <long> <SYMBOL> <entry> sl <price> tp1 <price> [tp2...]"""
-    parts = text.strip().split()
-    if len(parts) < 7:
-        return "❌ Usage: /spot <long> <SYMBOL> <entry> sl <price> tp1 <price> [tp2 <price> ...]"
-
-    direction = parts[1].lower()
-    if direction not in ("long", "buy"):
-        return "❌ Spot hanya mendukung LONG/BUY."
-
-    coin = parts[2].upper()
-
-    try:
-        entry = float(parts[3])
-    except ValueError:
-        return f"❌ Invalid entry price: {parts[3]}"
-
-    keywords = {}
-    i = 4
-    while i < len(parts):
-        kw = parts[i].lower()
-        if kw == "sl":
-            if i + 1 >= len(parts):
-                return f"❌ Missing value for '{kw}'"
-            keywords[kw] = parts[i + 1]
-            i += 2
-        elif kw.startswith("tp"):
-            if i + 1 >= len(parts):
-                return f"❌ Missing value for '{kw}'"
-            keywords[kw] = parts[i + 1]
-            i += 2
-        elif kw == "lev":
-            return "❌ Spot tidak memakai leverage (hapus 'lev')."
-        else:
-            return f"❌ Unknown keyword: {kw}. Use: sl, tp1, tp2, ..."
-
-    if "sl" not in keywords:
-        return "❌ Missing 'sl' (stop loss) price."
-
-    try:
-        sl_price = float(keywords["sl"])
-    except ValueError:
-        return "❌ Invalid numeric value for sl."
-
-    targets = []
-    tp_keys = sorted([k for k in keywords if k.startswith("tp")], key=lambda x: int(x[2:]))
-    for k in tp_keys:
-        try:
-            targets.append(float(keywords[k]))
-        except ValueError:
-            return f"❌ Invalid price for {k}."
-
-    if not targets:
-        return "❌ At least one tp1 is required."
-
-    if entry <= 0:
-        return "❌ Entry price must be positive."
-    if sl_price >= entry:
-        return f"❌ For SPOT LONG: SL ({sl_price}) must be below entry ({entry})."
-    for tp in targets:
-        if tp <= entry:
-            return f"❌ For SPOT LONG: TP ({tp}) must be above entry ({entry})."
-    if targets != sorted(targets):
-        return "❌ For SPOT LONG: TP prices should be ordered from lowest to highest (tp1 closest to entry)."
-
-    now_wib = datetime.now(timezone(timedelta(hours=8)))
-    now_str = now_wib.strftime("%Y-%m-%dT%H:%M:%S+08:00")
-    risk_r = abs(entry - sl_price)
-    trade = {
-        "id": f"{now_wib.strftime('%m-%d')}-{coin}-{int(entry)}",
-        "created_at": now_str,
-        "market": "spot",
-        "direction": "long",
-        "coin": coin,
-        "entry": entry,
-        "sl": sl_price,
-        "targets": targets,
-        "status": "active",
-        "risk_r": round(risk_r, 2),
-        "tp_status": [{"price": tp, "hit": False, "hit_at": None} for tp in targets],
-        "sl_hit": False,
-        "sl_hit_at": None,
-        "notes": "",
-    }
-    return trade
-
-
-def add_spot_trade_to_journal(trade):
-    """Add a spot trade entry to the current month's spot journal."""
-    now_wib = datetime.now(timezone(timedelta(hours=8)))
-    month_str = now_wib.strftime("%Y-%m")
-    journal = load_spot_journal(month_str)
-    journal["trades"].append(trade)
-    save_spot_journal(month_str, journal)
-    return True
-
-
-def generate_spot_stats(month_str=None):
-    """Generate monthly spot trade statistics."""
-    if month_str is None:
-        now_wib = datetime.now(timezone(timedelta(hours=8)))
-        month_str = now_wib.strftime("%Y-%m")
-
-    journal = load_spot_journal(month_str)
-    trades = journal.get("trades", [])
-    if not trades:
-        return "🟩 **Spot Journal** — {}\n\nNo trades recorded this month.".format(month_str)
-
-    total = len(trades)
-    status_counts = {}
-    for t in trades:
-        s = t.get("status", "active")
-        status_counts[s] = status_counts.get(s, 0) + 1
-
-    resolved = [t for t in trades if t.get("status") in ("completed", "stopped_out")]
-    winners = [t for t in resolved if t["status"] == "completed"]
-    win_rate = (len(winners) / len(resolved) * 100) if resolved else 0
-
-    rr_values = []
-    roi_values = []
-    for t in resolved:
-        if t.get("status") == "completed":
-            best_tp = None
-            for tp in t["tp_status"]:
-                if tp["hit"]:
-                    best_tp = tp["price"]
-            if best_tp and t.get("risk_r", 0) > 0:
-                r_val = (best_tp - t["entry"]) / t["risk_r"]
-                roi = (best_tp - t["entry"]) / t["entry"] * 100
-                rr_values.append(r_val)
-                roi_values.append(roi)
-        else:
-            rr_values.append(-1.0)
-            roi_values.append(-(t.get("entry", 0) - t.get("sl", t.get("entry", 0) - 1)) / t.get("entry", 1) * 100)
-
-    avg_rr = sum(rr_values) / len(rr_values) if rr_values else 0
-    avg_roi = sum(roi_values) / len(roi_values) if roi_values else 0
-    best_rr = max(rr_values) if rr_values else 0
-    worst_rr = min(rr_values) if rr_values else 0
-
-    best_trade = ""
-    worst_trade = ""
-    if rr_values:
-        best_idx = rr_values.index(best_rr)
-        worst_idx = rr_values.index(worst_rr)
-        bcoin = resolved[best_idx].get("coin", "??")
-        best_trade = f"{bcoin} +{best_rr:.1f}R (+{roi_values[best_idx]:.1f}%)"
-        wcoin = resolved[worst_idx].get("coin", "??")
-        worst_trade = f"{wcoin} {worst_rr:.1f}R ({roi_values[worst_idx]:.1f}%)"
-
-    active = status_counts.get("active", 0)
-    completed = status_counts.get("completed", 0)
-    stopped = status_counts.get("stopped_out", 0)
-
-    lines = [
-        f"🟩 **Spot Journal** — {month_str}",
-        f"",
-        f"Trades: {total} | ✅ Complete: {completed} | ❌ Stopped: {stopped}",
-        f"📌 Active: {active}",
-        f"",
-    ]
-    if resolved:
-        lines.append(f"Win Rate: {win_rate:.1f}% ({completed}/{len(resolved)} resolved)")
-        lines.append(f"Avg R:R: {avg_rr:+.1f}R | Avg ROI: {avg_roi:+.1f}%")
-        lines.append(f"")
-        lines.append(f"🏆 Best: {best_trade}")
-        lines.append(f"💀 Worst: {worst_trade}")
-
-    active_trades = [t for t in trades if t.get("status") == "active"]
-    if active_trades:
-        lines.append(f"")
-        lines.append(f"**Active Spot Trades** — {len(active_trades)}")
-        max_list = 30
-        for t in active_trades[:max_list]:
-            tps_hit = sum(1 for tp in t.get("tp_status", []) if tp.get("hit"))
-            tps_total = len(t.get("tp_status", []))
-            lines.append(
-                f"  {t.get('coin','??')} | "
-                f"Entry {t.get('entry','?')} | SL {t.get('sl','?')} | "
-                f"TP {tps_hit}/{tps_total} | "
-                f"ID: {t.get('id','')}"
-            )
-        if len(active_trades) > max_list:
-            lines.append(f"  ... +{len(active_trades) - max_list} more")
-
-    return "\n".join(lines)
-
-
-def check_level_crossing(trade, klines):
-    """Check if price crossed any key levels using 1h candle data.
-    Returns updated trade dict and list of events."""
-    if not klines or len(klines) < 2:
-        return trade, []
-
-    direction = trade["direction"]
-    events = []
-
-    for k in klines:
-        high = float(k[2])
-        low = float(k[3])
-        kline_ts = k[0]
-
-        # For SHORT: entry/invalid/SL are ABOVE, TPs are BELOW
-        # Entry/SL/Invalid crossed when high >= level
-        # TP crossed when low <= level
-        if direction == "short":
-            cross_up = lambda level: high >= level
-            cross_down = lambda level: low <= level
-        else:
-            # For LONG: entry/invalid/SL are BELOW, TPs are ABOVE
-            # Entry/SL/Invalid crossed when low <= level
-            # TP crossed when high >= level
-            cross_up = lambda level: high >= level
-            cross_down = lambda level: low <= level
-
-        if direction == "short":
-            crosses_entry = cross_up(trade["entry"])
-            crosses_invalid = trade["invalid"] is not None and cross_up(trade["invalid"])
-            crosses_sl = cross_up(trade["sl"])
-        else:
-            crosses_entry = cross_down(trade["entry"])
-            crosses_invalid = trade["invalid"] is not None and cross_down(trade["invalid"])
-            crosses_sl = cross_down(trade["sl"])
-
-        # Priority: invalid > SL > entry > TPs
-        if not trade["invalidated"] and not trade["entry_filled"] and crosses_invalid:
-            trade["invalidated"] = True
-            trade["invalidated_at"] = datetime.fromtimestamp(kline_ts / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
-            trade["status"] = "invalidated"
-            events.append(f"🚫 {trade['coin']} {trade['direction'].upper()}: Invalidated at {trade['invalid']}")
-            break
-
-        if not trade["entry_filled"] and crosses_entry:
-            trade["entry_filled"] = True
-            trade["entry_filled_at"] = datetime.fromtimestamp(kline_ts / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
-            trade["status"] = "active"
-            events.append(f"✅ {trade['coin']} {trade['direction'].upper()}: Entry filled at {trade['entry']}")
-
-        if trade["entry_filled"] and not trade["sl_hit"] and crosses_sl:
-            trade["sl_hit"] = True
-            trade["sl_hit_at"] = datetime.fromtimestamp(kline_ts / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
-            trade["status"] = "stopped_out"
-            events.append(f"💀 {trade['coin']} {trade['direction'].upper()}: Stopped out at {trade['sl']}")
-            break
-
-        if trade["entry_filled"]:
-            for i, tp in enumerate(trade["tp_status"]):
-                if not tp["hit"]:
-                    if direction == "short":
-                        hit = cross_down(tp["price"])
-                    else:
-                        hit = cross_up(tp["price"])
-                    if hit:
-                        tp["hit"] = True
-                        tp["hit_at"] = datetime.fromtimestamp(kline_ts / 1000, tz=timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
-                        r_achieved = abs(tp["price"] - trade["entry"]) / trade["risk_r"] if trade["risk_r"] > 0 else 0
-                        events.append(f"🎯 {trade['coin']} TP{i+1} ({tp['price']}) hit — {r_achieved:.1f}R")
-
-            # Check if all TPs hit
-            if all(tp["hit"] for tp in trade["tp_status"]):
-                trade["all_tps_hit"] = True
-                trade["status"] = "completed"
-                break
-
-        # Update after each candle
-        trade["last_sync"] = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%dT%H:%M:%S+08:00")
-
-    return trade, events
-
-
-def sync_trades():
-    """Sync all active trades with current price conditions (every 12h)."""
-    print("📊 Syncing trade journal...")
-
-    now_wib = datetime.now(timezone(timedelta(hours=8)))
-    month_str = now_wib.strftime("%Y-%m")
-    journal = load_journal(month_str)
-
-    if not journal.get("trades"):
-        print("  No trades to sync.")
-        return
-
-    all_events = []
-    updated_indices = []
-
-    for idx, trade in enumerate(journal["trades"]):
-        # Skip terminal trades
-        if trade["status"] in ("completed", "stopped_out", "invalidated"):
-            continue
-
-        sym = trade["symbol"]
-        # Fetch 1h klines for last 12 hours
-        klines = api_get("/fapi/v1/klines", {"symbol": sym, "interval": "1h", "limit": 13})
-        if not klines:
-            print(f"  ⚠️ No kline data for {sym}, skipping")
-            continue
-
-        updated_trade, events = check_level_crossing(trade, klines)
-        if events:
-            journal["trades"][idx] = updated_trade
-            updated_indices.append(idx)
-            all_events.extend(events)
-
-        time.sleep(0.1)
-
-    if updated_indices:
-        save_journal(month_str, journal)
-        print(f"  ✅ Updated {len(updated_indices)} trades: {len(all_events)} events")
-
-        # Send Telegram report
-        lines = [
-            f"📊 **Trade Sync Report** — {now_wib.strftime('%Y-%m-%d %H:%M')} WIB",
-            f"",
-        ]
-        for event in all_events:
-            lines.append(f"  {event}")
-
-        # Summary of active trades
-        active_trades = [t for t in journal["trades"] if t["status"] in ("pending", "active")]
-        if active_trades:
-            lines.append(f"")
-            lines.append(f"**Active Trades** ({len(active_trades)}):")
-            for t in active_trades:
-                tps_hit = sum(1 for tp in t["tp_status"] if tp["hit"])
-                tps_total = len(t["tp_status"])
-                lines.append(
-                    f"  {t['coin']} {t['direction'].upper()} | "
-                    f"Entry: {t['entry']} | SL: {t['sl']} | Status: {t['status']} | "
-                    f"TPs: {tps_hit}/{tps_total}"
-                )
-
-        send_telegram("\n".join(lines))
-    else:
-        print("  No trade status changes.")
-
-
-def generate_perps_stats(month_str=None):
-    """Generate monthly perps trade statistics."""
-    if month_str is None:
-        now_wib = datetime.now(timezone(timedelta(hours=8)))
-        month_str = now_wib.strftime("%Y-%m")
-
-    journal = load_journal(month_str)
-    trades = journal.get("trades", [])
-
-    if not trades:
-        return "📈 Perps Journal — {}\n\nNo trades recorded this month.".format(month_str)
-
-    total = len(trades)
-    status_counts = {}
-    for t in trades:
-        s = t.get("status", "pending")
-        status_counts[s] = status_counts.get(s, 0) + 1
-
-    # Resolved trades (completed or stopped_out, not pending/invalidated)
-    resolved = [t for t in trades if t.get("status") in ("completed", "stopped_out")]
-    winners = [t for t in resolved if t["status"] == "completed"]
-    losers = [t for t in resolved if t["status"] == "stopped_out"]
-
-    win_rate = (len(winners) / len(resolved) * 100) if resolved else 0
-
-    # Calculate R:R and ROI for resolved trades
-    rr_values = []
-    roi_values = []
-    for t in resolved:
-        lev = int(t.get("lev", 1) or 1)
-        if lev <= 0:
-            lev = 1
-        if t.get("status") == "completed":
-            # Best TP hit
-            best_tp = None
-            for tp in t["tp_status"]:
-                if tp["hit"]:
-                    best_tp = tp["price"]
-            if best_tp and t.get("risk_r", 0) > 0:
-                if t.get("direction") == "short":
-                    r_val = (t["entry"] - best_tp) / t["risk_r"]
-                    roi = (t["entry"] - best_tp) / t["entry"] * 100 * lev
-                else:
-                    r_val = (best_tp - t["entry"]) / t["risk_r"]
-                    roi = (best_tp - t["entry"]) / t["entry"] * 100 * lev
-                rr_values.append(r_val)
-                roi_values.append(roi)
-        else:  # stopped_out
-            rr_values.append(-1.0)
-            if t.get("direction") == "short":
-                roi_values.append(-(t.get("sl", t.get("entry", 0) + 1) - t.get("entry", 0)) / t.get("entry", 1) * 100 * lev)
-            else:
-                roi_values.append(-(t.get("entry", 0) - t.get("sl", t.get("entry", 0) - 1)) / t.get("entry", 1) * 100 * lev)
-
-    avg_rr = sum(rr_values) / len(rr_values) if rr_values else 0
-    avg_roi = sum(roi_values) / len(roi_values) if roi_values else 0
-    best_rr = max(rr_values) if rr_values else 0
-    worst_rr = min(rr_values) if rr_values else 0
-
-    # Find best and worst trade names
-    best_trade = ""
-    worst_trade = ""
-    if rr_values:
-        best_idx = rr_values.index(best_rr)
-        worst_idx = rr_values.index(worst_rr)
-        bcoin = resolved[best_idx].get("coin", "??")
-        bdir = resolved[best_idx].get("direction", "??").upper()
-        best_trade = f"{bcoin} {bdir} +{best_rr:.1f}R (+{roi_values[best_idx]:.1f}%)"
-        wcoin = resolved[worst_idx].get("coin", "??")
-        wdir = resolved[worst_idx].get("direction", "??").upper()
-        worst_trade = f"{wcoin} {wdir} {worst_rr:.1f}R ({roi_values[worst_idx]:.1f}%)"
-
-    # Long vs Short breakdown
-    longs = [t for t in trades if t.get("direction") == "long"]
-    shorts = [t for t in trades if t.get("direction") == "short"]
-    long_w = sum(1 for t in longs if t.get("status") == "completed")
-    long_l = sum(1 for t in longs if t.get("status") == "stopped_out")
-    long_p = sum(1 for t in longs if t.get("status") == "pending")
-    long_a = sum(1 for t in longs if t.get("status") == "active")
-    long_i = sum(1 for t in longs if t.get("status") == "invalidated")
-    short_w = sum(1 for t in shorts if t.get("status") == "completed")
-    short_l = sum(1 for t in shorts if t.get("status") == "stopped_out")
-    short_p = sum(1 for t in shorts if t.get("status") == "pending")
-    short_a = sum(1 for t in shorts if t.get("status") == "active")
-    short_i = sum(1 for t in shorts if t.get("status") == "invalidated")
-
-    pending = status_counts.get("pending", 0)
-    active = status_counts.get("active", 0)
-    completed = status_counts.get("completed", 0)
-    stopped = status_counts.get("stopped_out", 0)
-    invalid = status_counts.get("invalidated", 0)
-
-    lines = [
-        f"📈 **Perps Journal** — {month_str}",
-        f"",
-        f"Trades: {total} | ✅ Complete: {completed} | ❌ Stopped: {stopped}",
-        f"⏳ Active: {active} | 🕐 Pending: {pending} | 🚫 Invalid: {invalid}",
-        f"",
-    ]
-    if resolved:
-        lines.append(f"Win Rate: {win_rate:.1f}% ({completed}/{len(resolved)} resolved)")
-        lines.append(f"Avg R:R: {avg_rr:+.1f}R | Avg ROI: {avg_roi:+.1f}%")
-        lines.append(f"")
-        lines.append(f"🏆 Best: {best_trade}")
-        lines.append(f"💀 Worst: {worst_trade}")
-        lines.append(f"")
-    if longs:
-        long_detail = f"{len(longs)} ({long_w}W/"
-        parts_l = []
-        if long_l: parts_l.append(f"{long_l}L")
-        if long_a: parts_l.append(f"{long_a}A")
-        if long_p: parts_l.append(f"{long_p}P")
-        if long_i: parts_l.append(f"{long_i}I")
-        long_detail += "/".join(parts_l) + ")"
-        lines.append(f"Long: {long_detail}")
-    if shorts:
-        short_detail = f"{len(shorts)} ({short_w}W/"
-        parts_s = []
-        if short_l: parts_s.append(f"{short_l}L")
-        if short_a: parts_s.append(f"{short_a}A")
-        if short_p: parts_s.append(f"{short_p}P")
-        if short_i: parts_s.append(f"{short_i}I")
-        short_detail += "/".join(parts_s) + ")"
-        lines.append(f"Short: {short_detail}")
-
-    active_trades = [t for t in trades if t.get("status") == "active"]
-    if active_trades:
-        lines.append(f"")
-        lines.append(f"**Active Trades** — {len(active_trades)}")
-        max_list = 30
-        for t in active_trades[:max_list]:
-            lev = int(t.get("lev", 1) or 1)
-            if lev <= 0:
-                lev = 1
-            tps_hit = sum(1 for tp in t.get("tp_status", []) if tp.get("hit"))
-            tps_total = len(t.get("tp_status", []))
-            lines.append(
-                f"  {t.get('coin','??')} {t.get('direction','??').upper()} | "
-                f"Entry {t.get('entry','?')} | Lev {lev}x | "
-                f"SL {t.get('sl','?')} | TP {tps_hit}/{tps_total} | "
-                f"ID: {t.get('id','')}"
-            )
-        if len(active_trades) > max_list:
-            lines.append(f"  ... +{len(active_trades) - max_list} more")
-
-    pending_limit_setups = [
-        t for t in trades
-        if t.get("status") == "pending"
-        and not t.get("entry_filled", False)
-        and t.get("invalid") is not None
-    ]
-    if pending_limit_setups:
-        lines.append(f"")
-        lines.append(f"**Pending /limit (deletable)** — {len(pending_limit_setups)}")
-        max_list = 30
-        for t in pending_limit_setups[:max_list]:
-            lev = int(t.get("lev", 1) or 1)
-            if lev <= 0:
-                lev = 1
-            lines.append(
-                f"  {t.get('coin','??')} {t.get('direction','??').upper()} | "
-                f"Entry {t.get('entry','?')} | Lev {lev}x | "
-                f"ID: {t.get('id','')}"
-            )
-        if len(pending_limit_setups) > max_list:
-            lines.append(f"  ... +{len(pending_limit_setups) - max_list} more")
-
-    return "\n".join(lines)
-
-
 LAST_TG_UPDATE_ID = 0
 
 
@@ -2513,107 +2166,7 @@ def check_telegram_commands(conn):
                 LAST_TG_UPDATE_ID = update["update_id"]
                 continue
 
-            if text.startswith("/limit"):
-                print(f"[TG] /limit received: {text[:80]}")
-                result = parse_limit_command(text)
-                if isinstance(result, str):
-                    # Error message
-                    send_telegram_plain(result)
-                    print(f"[TG] /limit error: {result[:80]}")
-                else:
-                    add_trade_to_journal(result)
-                    # Build confirmation
-                    direction_emoji = "🔴 SHORT" if result["direction"] == "short" else "🟢 LONG"
-                    tps_lines = []
-                    for i, tp in enumerate(result["tp_status"]):
-                        r_val = abs(tp["price"] - result["entry"]) / result["risk_r"] if result["risk_r"] > 0 else 0
-                        tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R)")
-                    reply = (
-                        f"✅ Trade saved: {direction_emoji} {result['coin']} @ {result['entry']} (Lev {result.get('lev', 1)}x)\n"
-                        f"SL: {result['sl']} | Invalid: {result['invalid']}\n"
-                        + "\n".join(tps_lines)
-                    )
-                    reply += f"\n\nID: {result['id']}"
-                    send_telegram_plain(reply)
-                    print(f"[TG] Trade saved: {result['id']}")
-                LAST_TG_UPDATE_ID = update["update_id"]
-            elif text.startswith("/position"):
-                print(f"[TG] /position received: {text[:80]}")
-                reply, _ = process_position_command(text)
-                send_telegram_plain(reply)
-                print(f"[TG] /position processed")
-                LAST_TG_UPDATE_ID = update["update_id"]
-            elif text.startswith("/delete") or text.startswith("/del"):
-                parts = text.strip().split()
-                if len(parts) < 2:
-                    send_telegram_plain("❌ Usage: /delete <trade_id>\nExample: /delete 05-15-BTC-81000")
-                else:
-                    _, msg = remove_pending_limit_trade_from_journal(parts[1])
-                    send_telegram_plain(msg)
-                LAST_TG_UPDATE_ID = update["update_id"]
-            elif text.startswith("/adjust"):
-                parts = text.strip().split()
-                if len(parts) == 3:
-                    trade_id = parts[1]
-                    new_entry_raw = parts[2]
-                elif len(parts) == 4 and parts[2].lower() == "entry":
-                    trade_id = parts[1]
-                    new_entry_raw = parts[3]
-                else:
-                    send_telegram_plain("❌ Usage: /adjust <trade_id> <new_entry>\nExample: /adjust 05-15-BTC-81000 80500")
-                    LAST_TG_UPDATE_ID = update["update_id"]
-                    continue
-
-                try:
-                    new_entry = float(new_entry_raw)
-                except ValueError:
-                    send_telegram_plain(f"❌ Invalid entry price: {new_entry_raw}")
-                    LAST_TG_UPDATE_ID = update["update_id"]
-                    continue
-
-                ok, msg = adjust_perps_trade_entry(trade_id, new_entry)
-                if (not ok) and ("tidak ditemukan" in msg.lower()):
-                    ok, msg = adjust_spot_trade_entry(trade_id, new_entry)
-                send_telegram_plain(msg)
-                LAST_TG_UPDATE_ID = update["update_id"]
-            elif text == "/spot":
-                try:
-                    stats_text = generate_spot_stats()
-                    send_telegram_plain(stats_text)
-                except Exception as e:
-                    print(f"[TG] Spot stats failed: {e}")
-                    send_telegram_plain("Error generating spot stats. Check logs.")
-                LAST_TG_UPDATE_ID = update["update_id"]
-            elif text.startswith("/spot"):
-                result = parse_spot_command(text)
-                if isinstance(result, str):
-                    send_telegram_plain(result)
-                else:
-                    add_spot_trade_to_journal(result)
-                    tps_lines = []
-                    for i, tp in enumerate(result["tp_status"]):
-                        r_val = abs(tp["price"] - result["entry"]) / result["risk_r"] if result["risk_r"] > 0 else 0
-                        tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R)")
-                    reply = (
-                        f"✅ Spot trade saved: 🟢 LONG {result['coin']} @ {result['entry']}\n"
-                        f"SL: {result['sl']}\n"
-                        + "\n".join(tps_lines)
-                    )
-                    send_telegram_plain(reply)
-                LAST_TG_UPDATE_ID = update["update_id"]
-            elif text == "/perps":
-                if not review_sent:
-                    print("[TG] /perps received, generating stats...")
-                    try:
-                        stats_text = generate_perps_stats()
-                        send_telegram_plain(stats_text)
-                        print("[TG] Perps stats sent")
-                    except Exception as e:
-                        print(f"[TG] Perps stats failed: {e}")
-                        send_telegram_plain("Error generating perps stats. Check logs.")
-                    review_sent = True
-                LAST_TG_UPDATE_ID = update["update_id"]
-            elif text == "/btc":
+            if text == "/btc":
                 if not review_sent:
                     print("[TG] /btc received, fetching brief...")
                     try:
@@ -2642,13 +2195,7 @@ def check_telegram_commands(conn):
                     "Commands:\n"
                     "/btc - Today's BTC bias brief\n"
                     "/review - Signal tracker performance report\n"
-                    "/limit - Add limit setup (e.g. /limit short BTC 81000 lev 20 invalid 81400 sl 81500 tp1 79000 tp2 78000)\n"
-                    "/delete - Delete pending /limit setup (e.g. /delete 05-15-BTC-81000)\n"
-                    "/adjust - Adjust entry price (e.g. /adjust 05-15-BTC-81000 80500)\n"
-                    "/position - Add market position (e.g. /position short BTC 80000 lev 20 sl 81000 tp1 79000 tp2 78000)\n"
-                    "/perps - Monthly perps trade stats\n"
-                    "/spot - Spot journal stats\n"
-                    "/spot <...> - Add spot position (e.g. /spot long BTC 81000 sl 80000 tp1 83000 tp2 85000)"
+                    "/help - Show this help message"
                 )
                 LAST_TG_UPDATE_ID = update["update_id"]
             else:
@@ -2658,194 +2205,6 @@ def check_telegram_commands(conn):
             set_app_state(conn, "last_tg_update_id", str(LAST_TG_UPDATE_ID))
     except Exception as e:
         print(f"[TG] Command check error: {e}")
-
-
-def listen_commands():
-    """Poll Telegram indefinitely for /review commands."""
-    global LAST_TG_UPDATE_ID
-    if not TG_BOT_TOKEN:
-        print("No Telegram bot token configured")
-        return
-
-    conn = init_db()
-    stored = get_app_state(conn, "last_tg_update_id", "0")
-    try:
-        stored_id = int(stored or 0)
-    except Exception:
-        stored_id = 0
-    if stored_id > LAST_TG_UPDATE_ID:
-        LAST_TG_UPDATE_ID = stored_id
-
-    print("Listening for Telegram commands (/review)...")
-
-    while True:
-        try:
-            params = {"timeout": 30}
-            if LAST_TG_UPDATE_ID > 0:
-                params["offset"] = LAST_TG_UPDATE_ID + 1
-
-            url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/getUpdates"
-            resp = requests.get(url, params=params, timeout=35)
-
-            if resp.status_code != 200:
-                print(f"[TG] getUpdates HTTP {resp.status_code}")
-                time.sleep(5)
-                continue
-
-            data = resp.json()
-            if not data.get("ok"):
-                print(f"[TG] getUpdates not ok: {data}")
-                time.sleep(5)
-                continue
-
-            updates = data.get("result", [])
-            if updates:
-                print(f"[TG] Received {len(updates)} update(s)")
-
-            for update in updates:
-                if "message" not in update:
-                    LAST_TG_UPDATE_ID = update["update_id"]
-                    continue
-
-                msg = update["message"]
-                text = msg.get("text", "").strip()
-                chat_id = str(msg.get("chat", {}).get("id", ""))
-
-                if chat_id != TG_CHAT_ID:
-                    LAST_TG_UPDATE_ID = update["update_id"]
-                    continue
-
-                if text.startswith("/limit"):
-                    print(f"[TG] /limit received: {text[:80]}")
-                    result = parse_limit_command(text)
-                    if isinstance(result, str):
-                        send_telegram_plain(result)
-                        print(f"[TG] /limit error: {result[:80]}")
-                    else:
-                        add_trade_to_journal(result)
-                        direction_emoji = "🔴 SHORT" if result["direction"] == "short" else "🟢 LONG"
-                        tps_lines = []
-                        for i, tp in enumerate(result["tp_status"]):
-                            r_val = abs(tp["price"] - result["entry"]) / result["risk_r"] if result["risk_r"] > 0 else 0
-                            tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R)")
-                        reply = (
-                            f"✅ Trade saved: {direction_emoji} {result['coin']} @ {result['entry']} (Lev {result.get('lev', 1)}x)\n"
-                            f"SL: {result['sl']} | Invalid: {result['invalid']}\n"
-                            + "\n".join(tps_lines)
-                        )
-                        reply += f"\n\nID: {result['id']}"
-                        send_telegram_plain(reply)
-                        print(f"[TG] Trade saved: {result['id']}")
-                elif text.startswith("/position"):
-                    print(f"[TG] /position received: {text[:80]}")
-                    reply, _ = process_position_command(text)
-                    send_telegram_plain(reply)
-                    print(f"[TG] /position processed")
-                elif text.startswith("/delete") or text.startswith("/del"):
-                    parts = text.strip().split()
-                    if len(parts) < 2:
-                        send_telegram_plain("❌ Usage: /delete <trade_id>\nExample: /delete 05-15-BTC-81000")
-                    else:
-                        _, msg = remove_pending_limit_trade_from_journal(parts[1])
-                        send_telegram_plain(msg)
-                elif text.startswith("/adjust"):
-                    parts = text.strip().split()
-                    if len(parts) == 3:
-                        trade_id = parts[1]
-                        new_entry_raw = parts[2]
-                    elif len(parts) == 4 and parts[2].lower() == "entry":
-                        trade_id = parts[1]
-                        new_entry_raw = parts[3]
-                    else:
-                        send_telegram_plain("❌ Usage: /adjust <trade_id> <new_entry>\nExample: /adjust 05-15-BTC-81000 80500")
-                        continue
-
-                    try:
-                        new_entry = float(new_entry_raw)
-                    except ValueError:
-                        send_telegram_plain(f"❌ Invalid entry price: {new_entry_raw}")
-                        continue
-
-                    ok, msg = adjust_perps_trade_entry(trade_id, new_entry)
-                    if (not ok) and ("tidak ditemukan" in msg.lower()):
-                        ok, msg = adjust_spot_trade_entry(trade_id, new_entry)
-                    send_telegram_plain(msg)
-                elif text == "/perps":
-                    print("[TG] /perps received")
-                    try:
-                        stats_text = generate_perps_stats()
-                        send_telegram_plain(stats_text)
-                        print("[TG] Perps stats sent")
-                    except Exception as e:
-                        print(f"[TG] Perps stats error: {e}")
-                        send_telegram_plain(f"Error: {e}")
-                elif text == "/spot":
-                    print("[TG] /spot received")
-                    try:
-                        stats_text = generate_spot_stats()
-                        send_telegram_plain(stats_text)
-                        print("[TG] Spot stats sent")
-                    except Exception as e:
-                        print(f"[TG] Spot stats error: {e}")
-                        send_telegram_plain(f"Error: {e}")
-                elif text.startswith("/spot"):
-                    print(f"[TG] /spot received: {text[:80]}")
-                    result = parse_spot_command(text)
-                    if isinstance(result, str):
-                        send_telegram_plain(result)
-                        print(f"[TG] /spot error: {result[:80]}")
-                    else:
-                        add_spot_trade_to_journal(result)
-                        tps_lines = []
-                        for i, tp in enumerate(result["tp_status"]):
-                            r_val = abs(tp["price"] - result["entry"]) / result["risk_r"] if result["risk_r"] > 0 else 0
-                            tps_lines.append(f"TP{i+1}: {tp['price']} ({r_val:.1f}R)")
-                        reply = (
-                            f"✅ Spot trade saved: 🟢 LONG {result['coin']} @ {result['entry']}\n"
-                            f"SL: {result['sl']}\n"
-                            + "\n".join(tps_lines)
-                        )
-                        send_telegram_plain(reply)
-                        print(f"[TG] Spot trade saved: {result['id']}")
-                elif text == "/btc":
-                    print("[TG] /btc received")
-                    try:
-                        msg, _ = get_btc_brief_today()
-                        send_telegram(msg)
-                        print("[TG] BTC brief sent")
-                    except Exception as e:
-                        print(f"[TG] BTC brief error: {e}")
-                        send_telegram_plain(f"Error: {e}")
-                elif text == "/review":
-                    print("[TG] /review received")
-                    try:
-                        report_text = generate_review_report(conn)
-                        send_telegram_plain(report_text)
-                        print("[TG] Review report sent")
-                    except Exception as e:
-                        print(f"[TG] Review error: {e}")
-                        send_telegram_plain(f"Error: {e}")
-                elif text == "/help":
-                    send_telegram_plain(
-                        "Commands:\n"
-                        "/btc - Today's BTC bias brief\n"
-                        "/review - Signal tracker performance report\n"
-                        "/limit - Add limit setup (e.g. /limit short BTC 81000 lev 20 invalid 81400 sl 81500 tp1 79000 tp2 78000)\n"
-                        "/delete - Delete pending /limit setup (e.g. /delete 05-15-BTC-81000)\n"
-                        "/adjust - Adjust entry price (e.g. /adjust 05-15-BTC-81000 80500)\n"
-                        "/position - Add market position (e.g. /position short BTC 80000 lev 20 sl 81000 tp1 79000 tp2 78000)\n"
-                        "/perps - Monthly perps trade stats\n"
-                        "/spot - Spot journal stats\n"
-                        "/spot <...> - Add spot position (e.g. /spot long BTC 81000 sl 80000 tp1 83000 tp2 85000)"
-                    )
-
-                LAST_TG_UPDATE_ID = update["update_id"]
-                if LAST_TG_UPDATE_ID > stored_id:
-                    set_app_state(conn, "last_tg_update_id", str(LAST_TG_UPDATE_ID))
-                    stored_id = LAST_TG_UPDATE_ID
-        except Exception as e:
-            print(f"[TG] Poll error: {e}")
-            time.sleep(5)
 
 
 def review_signals(conn):
@@ -3182,196 +2541,201 @@ def main():
         ambush.sort(key=lambda x: x["total"], reverse=True)
         reversal = score_reversal(coin_data, pool_map, conn)
 
-        # 5.5 Save signals to tracker and check pending breakouts
-        now_str = datetime.now(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M")
-        save_signals(conn, chase, combined, ambush, reversal, coin_data, pool_map, now_str)
+        # ═══════════════════════════════════════
+        # v2: Origin strategy tagging per coin
+        # ═══════════════════════════════════════
+        chase_set = {s["coin"] for s in chase}
+        combined_set = {s["coin"] for s in combined}
+        ambush_set = {s["coin"] for s in ambush}
+        reversal_set = {s["coin"] for s in reversal}
+        origin_map = {}
+        for sym, d in coin_data.items():
+            coin = d["coin"]
+            origins = []
+            if coin in chase_set:    origins.append("momentum_chase")
+            if coin in combined_set: origins.append("combined")
+            if coin in ambush_set:   origins.append("ambush")
+            if coin in reversal_set: origins.append("reversal")
+            if d.get("in_cg") or d.get("vol_surge"):
+                origins.append("heat")
+            origin_map[sym] = origins
+
+        # ═══════════════════════════════════════
+        # v2: Load full pool data (with v2 fields) for lifecycle classifier
+        # ═══════════════════════════════════════
+        c2.execute("""SELECT symbol, low_price, high_price, current_price,
+                             sideways_days, range_pct, avg_vol, vol_breakout,
+                             breakout_state, pool_setup_state,
+                             distance_to_high_pct, range_position_pct,
+                             pool_quality_score, entry_readiness_score
+                      FROM watchlist""")
+        pool_v2_map = {}
+        for row in c2.fetchall():
+            pool_v2_map[row[0]] = {
+                "symbol": row[0],
+                "low_price": row[1], "high_price": row[2], "current_price": row[3],
+                "sideways_days": row[4], "range_pct": row[5], "avg_vol": row[6],
+                "vol_breakout": row[7], "breakout_state": row[8],
+                "pool_setup_state": row[9], "distance_to_high_pct": row[10],
+                "range_position_pct": row[11], "pool_quality_score": row[12],
+                "entry_readiness_score": row[13],
+            }
+
+        # ═══════════════════════════════════════
+        # v2: Lifecycle classification + snapshot persistence per coin
+        # ═══════════════════════════════════════
+        now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        now_wib = datetime.now(timezone(timedelta(hours=8)))
+        # Limit lifecycle classification to interesting coins (in pool or matched a strategy)
+        interesting_syms = set()
+        for sym, d in coin_data.items():
+            if d.get("in_pool") or d.get("heat", 0) > 0 or origin_map.get(sym):
+                interesting_syms.add(sym)
+            # Also include any coin with notable OI change
+            if abs(d.get("d6h", 0)) >= 5:
+                interesting_syms.add(sym)
+
+        lifecycle_results = []  # list of (coin_data_dict, classification_dict)
+        for sym in interesting_syms:
+            d = coin_data[sym]
+            pool_row = pool_v2_map.get(sym)
+            prior_1h = get_prior_snapshot(conn, sym, 1)
+            prior_3h = get_prior_snapshot(conn, sym, 3)
+            cls = classify_trade_state(d, prior_1h, prior_3h, pool_row)
+            cls["origin_strategies"] = origin_map.get(sym, [])
+            lifecycle_results.append((d, cls))
+
+            # Persist current snapshot
+            save_hourly_snapshot(conn, {
+                "symbol": sym,
+                "timestamp": now_iso,
+                "price": d.get("price"),
+                "price_24h_change_pct": d.get("px_chg"),
+                "open_interest": d.get("oi_usd"),
+                "oi_change_pct_from_baseline": d.get("d6h"),
+                "funding_rate": d.get("fr_pct", 0) / 100.0 if d.get("fr_pct") is not None else None,
+                "volume_24h": None,
+                "quote_volume_24h": d.get("vol"),
+                "pool_setup_state": (pool_row or {}).get("pool_setup_state"),
+                "breakout_state": (pool_row or {}).get("breakout_state"),
+                "trade_state": cls["trade_state"],
+                "action": cls["action"],
+                "origin_strategies": cls["origin_strategies"],
+            })
+
+        # Prune old snapshots (>7 days)
+        try:
+            prune_old_snapshots(conn, days_to_keep=7)
+        except Exception as e:
+            print(f"[snapshot] prune failed: {e}")
+
+        # ═══════════════════════════════════════
+        # 5.5 Save signals to tracker and check pending breakouts (v2-aware)
+        # ═══════════════════════════════════════
+        now_str = now_wib.strftime("%Y-%m-%d %H:%M")
+        trade_state_map = {}
+        action_map = {}
+        origin_pool_state_map = {}
+        for d, cls in lifecycle_results:
+            trade_state_map[d["sym"]] = cls["trade_state"]
+            action_map[d["sym"]] = cls["action"]
+            origin_pool_state_map[d["sym"]] = cls.get("origin_pool_setup_state")
+
+        save_signals(conn, chase, combined, ambush, reversal, coin_data, pool_map, now_str,
+                     trade_state_map=trade_state_map, action_map=action_map,
+                     origin_pool_state_map=origin_pool_state_map)
         check_breakouts(conn, ticker_map)
 
         # ═══════════════════════════════════════
-        # 6. Build notification + worth-watching highlights
+        # v2: New lifecycle-bucketed output
         # ═══════════════════════════════════════
         def mcap_str(v):
             if v >= 1e6: return f"${v/1e6:.0f}M"
             if v >= 1e3: return f"${v/1e3:.0f}K"
             return f"${v:.0f}"
-        
-        now = datetime.now(timezone(timedelta(hours=8)))
+
+        def fmt_delta(x, suffix="%"):
+            return f"{x:+.1f}{suffix}" if x is not None else "N/A"
+
+        # Bucket the lifecycle results
+        buckets = {"ACTIONABLE": [], "ALERT": [], "ACTIVE_LATE": [], "AVOID": []}
+        for d, cls in lifecycle_results:
+            buckets[bucket_of(cls["trade_state"])].append((d, cls))
+
+        # Sort: actionable/alert by entry_readiness_score desc, late by price_24h desc
+        def sort_actionable(item):
+            d, cls = item
+            pool = pool_v2_map.get(d["sym"], {})
+            return pool.get("entry_readiness_score") or 0
+        def sort_late(item):
+            d, _cls = item
+            return d.get("px_chg") or 0
+        buckets["ACTIONABLE"].sort(key=sort_actionable, reverse=True)
+        buckets["ALERT"].sort(key=sort_actionable, reverse=True)
+        buckets["ACTIVE_LATE"].sort(key=sort_late, reverse=True)
+        buckets["AVOID"].sort(key=sort_late, reverse=True)
+
+        def render_token_block(d, cls, pool_row):
+            """Render one OI token as exactly 2 lines (compact v2.1, Opsi B)."""
+            state = cls["trade_state"]
+            status_em = TRADE_STATE_EMOJI.get(state, "•")
+
+            # Line 1 metrics
+            px24 = d.get("px_chg", 0) or 0
+            oi6h = d.get("d6h", 0) or 0
+            fr_pct = d.get("fr_pct", 0) or 0
+            p_arrow = _price_arrow(px24)
+            f_icon = _funding_icon(fr_pct)
+
+            p_1h = cls.get("price_1h_change_pct")
+            o_1h = cls.get("oi_1h_change_pct")
+            one_h_arrow = _delta_arrow(p_1h, o_1h)
+            one_h_str = _fmt_delta_pair(p_1h, o_1h)
+
+            line1 = (
+                f"{status_em} **{d['coin']}** {_pretty_state(state)} ▸ "
+                f"{p_arrow}{px24:+.0f}% 💰{oi6h:+.0f}% {f_icon}{fr_pct:+.2f}% ▸ "
+                f"1h{one_h_arrow}{one_h_str}"
+            )
+
+            # Line 2: transition + via + action
+            trans = _abbrev_transition(cls.get("transition") or "UNK")
+            via = _short_origins(cls.get("origin_strategies") or [])
+            action = ACTION_COMPACT.get(state, cls.get("action", ""))
+
+            line2 = f"   {trans} via {via} ▸ {action}"
+
+            return [line1, line2]
+
         lines = [
-            f"🏦 **Smart Money Radar** - Three Strategies + Heat",
-            f"⏰ {now.strftime('%Y-%m-%d %H:%M')} WIB",
+            f"🏦 **Smart Money Radar** - Hourly Progression",
+            f"⏰ {now_wib.strftime('%Y-%m-%d %H:%M')} WIB",
+            f"━━━━━━━━━━━━━━━━━━",
         ]
-        
-        # Table 0: heat ranking (most important, put first)
-        hot_coins = sorted(
-            [d for d in coin_data.values() if d["heat"] > 0],
-            key=lambda x: x["heat"], reverse=True
-        )
-        if hot_coins:
-            lines.append(f"\n🔥 **Heat Ranking** (CG trending + volume surge)")
-            for s in hot_coins[:8]:
-                tags = []
-                if s["in_cg"]: tags.append("🌐CG Trending")
-                if s["vol_surge"]: tags.append("📈Vol Surge")
-                oi_tag = f"OI{s['d6h']:+.0f}%" if abs(s["d6h"]) >= 3 else ""
-                if oi_tag: tags.append(f"⚡{oi_tag}")
-                if s["in_pool"]: tags.append(f"💤Pool {s['sw_days']}d")
-                fr_tag = f"🧊{s['fr_pct']:.2f}%" if s["fr_pct"] < -0.03 else ""
-                if fr_tag: tags.append(fr_tag)
-                lines.append(
-                    f"  {s['coin']:<8} ~{mcap_str(s['est_mcap'])} Move {s['px_chg']:+.0f}% | {' '.join(tags)}"
-                )
-        
-        # Table 1: momentum chase
-        lines.append(f"\n🔥 **Momentum Chase** (ranked by funding)")
-        if chase:
-            for s in chase[:8]:
-                lines.append(
-                    f"  {s['coin']:<7} Funding {s['fr_pct']:+.3f}% {s['trend']}"
-                    f" | Move {s['px_chg']:+.0f}% | ~{mcap_str(s['est_mcap'])}"
-                )
-        else:
-            lines.append("  None yet (requires move >3% + negative funding)")
-        
-        # Table 2: combined
-        lines.append(f"\n📊 **Combined** (Funding + Market Cap + Sideways + OI, 25 each)")
-        for s in combined[:8]:
-            dims = []
-            if s["f_sc"] >= 10: dims.append(f"🧊{s['fr_pct']:.2f}%")
-            if s["m_sc"] >= 12: dims.append(f"💎{mcap_str(s['est_mcap'])}")
-            if s["s_sc"] >= 10: dims.append(f"💤{s['sw_days']}d")
-            if s["o_sc"] >= 10: dims.append(f"⚡OI{s['d6h']:+.0f}%")
-            lines.append(
-                f"  {s['coin']:<7} {s['total']} pts | {' '.join(dims)}"
-            )
-        
-        # Table 3: ambush
-        lines.append(f"\n🎯 **Ambush** (Market Cap 35 + OI 30 + Sideways 20 + Funding 15)")
-        for s in ambush[:8]:
-            tags = [f"~{mcap_str(s['est_mcap'])}"]
-            if abs(s["d6h"]) >= 2: tags.append(f"OI{s['d6h']:+.0f}%")
-            if s["d6h"] > 2 and abs(s["px_chg"]) < 5: tags.append("🎯Underflow")
-            if s["sw_days"] >= 45: tags.append(f"Sideways {s['sw_days']}d")
-            if s["fr_pct"] < -0.01: tags.append(f"Funding {s['fr_pct']:.2f}%")
-            lines.append(
-                f"  {s['coin']:<7} {s['total']} pts | {' '.join(tags)}"
-            )
 
-        # Table 4: reversal watch (short setups)
-        lines.append(f"\n🔻 **Reversal Watch** (Short setup candidates)")
-        if reversal:
-            for s in reversal[:8]:
-                tag_str = " ".join(s["rev_tags"][:3])
-                extra = []
-                if s["fr_pct"] > 0.03:
-                    extra.append(f"Fnd+{s['fr_pct']:.2f}%")
-                extr_str = " ".join(extra)
-                lines.append(
-                    f"  {s['coin']:<7} {s['rev_score']} pts | OI{s['d6h']:+.0f}% Px{s['px_chg']:+.0f}%"
-                    f" | ~{mcap_str(s['est_mcap'])} | {tag_str} {extr_str}".strip()
-                )
-        else:
-            lines.append("  None yet (no strong short signals)")
+        section_meta = [
+            ("ACTIONABLE",   "📍", "ACTIONABLE NOW",       "READY / TRIGGERED",                       10),
+            ("ALERT",        "🟠", "ALERT / NEXT SETUP",   "Early underflow / building",              8),
+            ("ACTIVE_LATE",  "🔥", "ACTIVE BUT LATE",      "Trending or extended — no fresh chase",   8),
+            ("AVOID",        "⚠️", "AVOID / DEPRIORITIZE", "No confirmation / covering / exit",       6),
+        ]
 
-        # Worth-watching highlights
-        highlights = []
-        
-        # Heat + pool overlap = strongest early signal
-        hot_pool = [d for d in coin_data.values() if d["heat"] > 0 and d["in_pool"]]
-        for s in sorted(hot_pool, key=lambda x: x["heat"], reverse=True)[:2]:
-            tags = []
-            if s["in_cg"]: tags.append("CG Trending")
-            if s["vol_surge"]: tags.append("Volume Surge")
-            highlights.append(f"🔥💤 {s['coin']} heat ({'+'.join(tags)}) + {s['sw_days']}d in accumulation = OI may follow")
-        
-        # Heat + OI already rising = move is underway
-        hot_oi = [d for d in coin_data.values() if d["heat"] > 0 and d["d6h"] > 5]
-        for s in sorted(hot_oi, key=lambda x: x["d6h"], reverse=True)[:2]:
-            if s["coin"] not in " ".join(highlights):
-                highlights.append(f"🔥⚡ {s['coin']} heat + OI{s['d6h']:+.0f}% are rising together!")
-        
-        # Top two momentum names with accelerating funding deterioration
-        chase_fire = [s for s in chase[:5] if "Accelerating" in s.get("trend", "")]
-        for s in chase_fire[:2]:
-            highlights.append(f"🔥 {s['coin']} funding {s['fr_pct']:.3f}% is deteriorating faster, shorts keep flooding in")
-        
-        # Coins appearing across multiple tables
-        chase_coins = set(s["coin"] for s in chase[:10])
-        combined_coins = set(s["coin"] for s in combined[:10])
-        ambush_coins = set(s["coin"] for s in ambush[:10])
-        reversal_coins = set(s["coin"] for s in reversal[:10])
+        rendered_any = False
+        for bucket_key, emoji, title, tagline, limit in section_meta:
+            items = buckets[bucket_key]
+            if not items:
+                continue
+            rendered_any = True
+            lines.append("")
+            lines.append(f"{emoji} **{title}** ({len(items)}) — {tagline}")
+            for d, cls in items[:limit]:
+                pool_row = pool_v2_map.get(d["sym"])
+                lines.extend(render_token_block(d, cls, pool_row))
+            if len(items) > limit:
+                lines.append(f"   ... +{len(items) - limit} more in {title}")
 
-        # Shared between momentum chase and combined
-        overlap_2 = chase_coins & combined_coins
-        if overlap_2:
-            for c in list(overlap_2)[:2]:
-                highlights.append(f"⭐ {c} appears in both Momentum Chase and Combined")
-
-        # Reversal coins also in combined/ambush = conflicting signals = interesting
-        rev_in_combined = reversal_coins & combined_coins
-        if rev_in_combined:
-            for c in list(rev_in_combined)[:1]:
-                highlights.append(f"⚠️ {c} in both Reversal + Combined = conflicting signal, watch closely")
-
-        # Reversal coins also in the pool (was accumulation, now reversing)
-        rev_in_pool = [s for s in reversal[:10] if s["in_pool"]]
-        for s in rev_in_pool[:1]:
-            if s["coin"] not in [h.split(" ")[1] for h in highlights]:
-                highlights.append(f"🔻 {s['coin']} in accumulation pool but showing short signal = thesis may be broken")
-        
-        # Ambush names showing underflow
-        ambush_dark = [s for s in ambush[:10] if s["d6h"] > 2 and abs(s["px_chg"]) < 5]
-        for s in ambush_dark[:2]:
-            highlights.append(f"🎯 {s['coin']} underflow! OI{s['d6h']:+.0f}% while price is flat, market cap only {mcap_str(s['est_mcap'])}")
-        
-        # Ambush names with very low market cap + OI anomaly
-        ambush_gem = [s for s in ambush[:10] if s["est_mcap"] < 100e6 and abs(s["d6h"]) >= 3]
-        for s in ambush_gem[:2]:
-            if s["coin"] not in [h.split(" ")[1] for h in highlights]:
-                highlights.append(f"💎 {s['coin']} low market cap {mcap_str(s['est_mcap'])} + OI{s['d6h']:+.0f}% makes it a top ambush candidate")
-
-        # Short/reversal highlights
-        rev_short_build = [s for s in reversal[:10] if s["d6h"] > 3 and s["px_chg"] < -2]
-        for s in rev_short_build[:2]:
-            highlights.append(f"🔻 {s['coin']} aggressive short build! OI{s['d6h']:+.0f}% + price {s['px_chg']:+.0f}%")
-
-        rev_squeeze = [s for s in reversal[:10] if s["fr_pct"] > 0.05 and abs(s["px_chg"]) < 3]
-        for s in rev_squeeze[:1]:
-            highlights.append(f"🔻 {s['coin']} funding +{s['fr_pct']:.2f}% stalled = long squeeze fuel")
-
-        rev_failed = [s for s in reversal[:10] if any("FailedBreakout" in t for t in s.get("rev_tags", []))]
-        for s in rev_failed[:1]:
-            highlights.append(f"🔻 {s['coin']} failed breakout: price fell back below range high")
-
-        rev_below = [s for s in reversal[:10] if s.get("in_pool") and s.get("range_low", 0) > 0 and s.get("price", 0) < s.get("range_low", 0)]
-        for s in rev_below[:1]:
-            highlights.append(f"🔻 {s['coin']} below accumulation range low = structure broken")
-
-        if highlights:
-            lines.append(f"\n💡 **Worth Watching**")
-            for h in highlights[:10]:
-                lines.append(f"  {h}")
-        
-        # What To Do guide (actionable, not just emoji legend)
-        lines.append(f"\n📖 **How To Trade These Signals**")
-        lines.append("")
-        lines.append("  🎯 **Underflow** (OI↑ Price flat) — Highest priority")
-        lines.append("     → Alert at range high, enter on VOLUME-CONFIRMED breakout (>3x)")
-        lines.append("     → Stop: below range low | Target: 2-3x range width")
-        lines.append("  🔥 **Momentum Chase** (neg funding + price moving)")
-        lines.append("     → Wait for pullback, don't chase green candles")
-        lines.append("     → Stop: -5% | Exit: funding flips above -0.01%")
-        lines.append("  💤 **Ambush / Pool Only** (accumulating, no move yet)")
-        lines.append("     → Not actionable yet -- add to Binance watchlist")
-        lines.append("     → Wait for: OI spike OR volume breakout OR funding flip")
-        lines.append("")
-        lines.append("  📊 **OI-Price Matrix**:")
-        lines.append("     OI↑ Price↑ = trend | OI↑ Price→ = 🎯underflow | OI↑ Price↓ = shorts | OI↓ Price↑ = squeeze")
-        lines.append("")
-        lines.append("  🔻 **Reversal Watch** (Short setups)")
-        lines.append("     → Best signal: OI rising + price falling = whales building shorts")
-        lines.append("     → Enter after first lower low, stop above recent swing high")
-        lines.append("     → Target: 1-2x sideways range downward")
-        lines.append("     → Failed breakout: short when price closes back below range high")
+        if not rendered_any:
+            lines.append("(No tokens classified this hour.)")
 
         report = "\n".join(lines)
 
@@ -3379,12 +2743,7 @@ def main():
         tracking_recap = build_tracking_recap(conn)
         if tracking_recap:
             report += "\n" + tracking_recap
-            if len(report) < 3500:
-                send_telegram(report)
-            else:
-                send_telegram(report)
-        else:
-            send_telegram(report)
+        send_telegram(report)
         if TG_POLL_COMMANDS_IN_OI:
             check_telegram_commands(conn)
     
@@ -3394,30 +2753,10 @@ def main():
         print("\n✅ BTC brief complete")
         return
 
-    if mode == "sync":
-        conn.close()
-        sync_trades()
-        print("\n✅ Trade sync complete")
-        return
-
     if mode == "review":
         review_signals(conn)
         print("\n✅ Review complete")
         conn.close()
-        return
-
-    if mode == "perps":
-        conn.close()
-        stats = generate_perps_stats()
-        if stats:
-            send_telegram_plain(stats)
-        print(stats)
-        print("\n✅ Perps stats complete")
-        return
-
-    if mode == "listen":
-        conn.close()
-        listen_commands()
         return
 
     conn.close()
