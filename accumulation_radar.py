@@ -2226,12 +2226,23 @@ def main():
     if mode in ("full", "pool"):
         # === Module A: update the accumulation pool ===
         results = scan_accumulation_pool()
-        
+
         if results:
             save_watchlist(conn, results)
             report = build_pool_report(results)
             if report:
                 send_telegram(report)
+        else:
+            existing = load_watchlist_symbols(conn)
+            if existing:
+                send_telegram(
+                    f"⚠️ *Pool scan gagal* (SSL/network error)\n"
+                    f"Menggunakan watchlist lama: {len(existing)} simbol.\n"
+                    f"OI scan tetap berjalan."
+                )
+                print(f"[pool] scan failed, keeping existing {len(existing)} watchlist entries")
+            else:
+                send_telegram("❌ Pool scan gagal & watchlist kosong. OI scan dilewati.")
     
     if mode in ("full", "oi"):
         # === Combined scan: OI + funding + accumulation in one pass ===
