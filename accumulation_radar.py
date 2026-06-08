@@ -2748,6 +2748,53 @@ def main():
         if not rendered_any:
             lines.append("(No tokens classified this hour.)")
 
+        # PREV WATCHED: tokens that were EARLY_UNDERFLOW in last 6h but not in this run
+        current_syms = {d["sym"] for d, _ in lifecycle_results}
+        cutoff_6h = (datetime.now(timezone.utc) - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%S")
+
+        prev_rows = conn.execute("""
+            SELECT symbol, trade_state, timestamp
+            FROM hourly_token_snapshots
+            WHERE trade_state = 'EARLY_UNDERFLOW'
+              AND timestamp >= ?
+              AND symbol NOT IN ({})
+            GROUP BY symbol
+            HAVING timestamp = MAX(timestamp)
+            ORDER BY timestamp DESC
+        """.format(",".join("?" * len(current_syms)) if current_syms else "'__none__'"),
+            ([cutoff_6h] + list(current_syms)) if current_syms else [cutoff_6h]
+        ).fetchall()
+
+        if prev_rows:
+            # For each, get their latest trade_state (may have changed since EARLY_UNDERFLOW)
+            prev_lines = []
+            for row in prev_rows:
+                sym = row["symbol"]
+                latest = conn.execute("""
+                    SELECT trade_state, timestamp FROM hourly_token_snapshots
+                    WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1
+                """, (sym,)).fetchone()
+                latest_state = latest["trade_state"] if latest else row["trade_state"]
+
+                # Label based on latest state
+                if latest_state in ("ACTIVE_TREND", "LATE_LONG", "TRIGGERED_LONG"):
+                    label = "sudah lari ❌ missed"
+                elif latest_state in ("NO_CONFIRMATION", "INVALIDATED", "SHORT_COVERING_ONLY"):
+                    label = "OI turun, skip"
+                elif latest_state in ("READY_LONG", "READY_SHORT", "TRIGGERED_SHORT"):
+                    label = "lihat ALERT/ACTIONABLE ✅"
+                elif latest_state == "EARLY_UNDERFLOW":
+                    label = "masih building"
+                else:
+                    label = latest_state.lower().replace("_", " ")
+
+                prev_lines.append(f"   {sym:<10} UNDER→{latest_state:<20} — {label}")
+
+            lines.append("")
+            lines.append(f"━━━━━━━━━━━━━━━━━━")
+            lines.append(f"📋 **PREV WATCHED** (EARLY_UNDERFLOW 6h lalu → sekarang)")
+            lines.extend(prev_lines)
+
         report = "\n".join(lines)
 
         # Append signal tracking recap if there are tracked signals
