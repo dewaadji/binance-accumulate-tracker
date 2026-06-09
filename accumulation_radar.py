@@ -331,6 +331,25 @@ def get_prior_snapshot(conn, symbol, hours_ago):
     return dict(row) if row else None
 
 
+def get_consecutive_eu_hours(conn, symbol, max_look=12):
+    """Count how many consecutive hours (most recent first) a token has been in EARLY_UNDERFLOW."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_look)).strftime("%Y-%m-%dT%H:%M:%S")
+    c = conn.cursor()
+    c.row_factory = sqlite3.Row
+    rows = c.execute("""
+        SELECT trade_state FROM hourly_token_snapshots
+        WHERE symbol = ? AND timestamp >= ?
+        ORDER BY timestamp DESC
+    """, (symbol, cutoff)).fetchall()
+    count = 0
+    for row in rows:
+        if row["trade_state"] == "EARLY_UNDERFLOW":
+            count += 1
+        else:
+            break
+    return count
+
+
 def prune_old_snapshots(conn, days_to_keep=7):
     """Delete snapshots older than N days to bound DB size."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=days_to_keep)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -1171,10 +1190,8 @@ def build_pool_report(results, top_n=25):
 
     buckets = [
         ("PRICE_BREAKOUT_CONFIRMED", "🟢", "PRICE BREAKOUT CONFIRMED", "Retest watch"),
-        ("ARMED_INSIDE_RANGE",       "🟠", "ARMED INSIDE RANGE",       "Volume anomaly but no price breakout yet"),
-        ("WAKING_UP",                "🟡", "WAKING UP",                "Early volume wake-up"),
-        ("EXTENDED_BREAKOUT",        "⚠️", "EXTENDED BREAKOUT",       "No new long, retest only"),
-        ("SLEEPING_ACCUMULATION",    "💤", "SLEEPING ACCUMULATION",    "Keep monitoring"),
+        ("ARMED_INSIDE_RANGE",       "🟠", "ARMED INSIDE RANGE",       "Volume anomaly — wait breakout + OI"),
+        ("WAKING_UP",                "🟡", "WAKING UP",                "Early accumulation signal"),
     ]
 
     # Group and sort each bucket by entry_readiness_score desc, then pool_quality_score desc
@@ -1190,8 +1207,6 @@ def build_pool_report(results, top_n=25):
         "PRICE_BREAKOUT_CONFIRMED": 10,
         "ARMED_INSIDE_RANGE":       10,
         "WAKING_UP":                10,
-        "EXTENDED_BREAKOUT":        5,
-        "SLEEPING_ACCUMULATION":    8,
     }
 
     any_shown = False
@@ -1257,6 +1272,37 @@ def build_oi_alert_report(alerts, watchlist_coins):
             )
     
     return "\n".join(lines)
+
+
+def send_telegram_temp(text):
+    """Send plain-text message and return message_id (for later deletion)."""
+    if not TG_BOT_TOKEN:
+        return None
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TG_CHAT_ID, "text": text},
+            timeout=10,
+        )
+        data = resp.json()
+        return data.get("result", {}).get("message_id")
+    except Exception as e:
+        print(f"[TG] send_telegram_temp error: {e}")
+        return None
+
+
+def delete_telegram_message(message_id):
+    """Delete a previously sent Telegram message."""
+    if not TG_BOT_TOKEN or not message_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/deleteMessage",
+            json={"chat_id": TG_CHAT_ID, "message_id": message_id},
+            timeout=10,
+        )
+    except Exception as e:
+        print(f"[TG] delete_telegram_message error: {e}")
 
 
 def send_telegram_plain(text):
@@ -1578,48 +1624,60 @@ def check_breakouts(conn, ticker_map):
 
 
 def build_tracking_recap(conn):
-    """Build a short performance recap for inclusion in Telegram reports."""
+    """Build a short performance recap (7-day window) for inclusion in Telegram reports."""
     c = conn.cursor()
+    cutoff_7d = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")
 
-    c.execute("SELECT status, COUNT(*) FROM signal_tracker GROUP BY status")
-    counts = {row[0]: row[1] for row in c.fetchall()}
+    # Pending: all active (no time filter — these are live watches)
+    pending = c.execute(
+        "SELECT COUNT(*) FROM signal_tracker WHERE status = 'pending'"
+    ).fetchone()[0]
 
-    pending = counts.get("pending", 0)
-    entered = counts.get("entered", 0)
-    expired = counts.get("expired", 0)
+    # Entered/expired: last 7 days only
+    entered = c.execute(
+        "SELECT COUNT(*) FROM signal_tracker WHERE status = 'entered' AND signal_time >= ?",
+        (cutoff_7d,)
+    ).fetchone()[0]
+    expired = c.execute(
+        "SELECT COUNT(*) FROM signal_tracker WHERE status = 'expired' AND signal_time >= ?",
+        (cutoff_7d,)
+    ).fetchone()[0]
 
     if pending + entered == 0:
         return ""
 
-    lines = ["", "📊 **Signal Tracking Recap**",
+    lines = ["", "📊 **Signal Tracking** (7d)",
              f"  {pending} pending | {entered} entered | {expired} expired"]
 
-    c.execute("""SELECT coin, signal_type, signal_price, entry_price,
-                 (entry_price - signal_price) / signal_price * 100
-                 FROM signal_tracker WHERE status = 'entered' ORDER BY entry_time DESC""")
+    # Win rate summary for entered signals in last 7 days
+    c.execute("""
+        SELECT signal_price, entry_price,
+               (entry_price - signal_price) / signal_price * 100 AS pnl
+        FROM signal_tracker
+        WHERE status = 'entered' AND signal_time >= ? AND entry_price IS NOT NULL
+    """, (cutoff_7d,))
     entered_signals = c.fetchall()
 
     if entered_signals:
-        profits = [s[4] for s in entered_signals if s[4] is not None]
+        profits = [row[2] for row in entered_signals if row[2] is not None]
         if profits:
             winners = sum(1 for p in profits if p > 0)
             avg_pnl = sum(profits) / len(profits)
-            lines.append(f"  In profit: {winners}/{len(profits)} | Avg +{avg_pnl:.1f}%")
+            lines.append(f"  Win: {winners}/{len(profits)} | Avg {avg_pnl:+.1f}%")
 
-            best = max(entered_signals, key=lambda x: x[4] or -999)
-            worst = min(entered_signals, key=lambda x: x[4] or 999)
-            lines.append(f"  🔥 Best: {best[0]} +{best[4]:.1f}% | 🔴 Worst: {worst[0]} {worst[4]:.1f}%")
-
-    c.execute("""SELECT signal_type, COUNT(*),
-                 SUM(CASE WHEN entry_price > signal_price THEN 1 ELSE 0 END)
-                 FROM signal_tracker WHERE status = 'entered' GROUP BY signal_type""")
-    for row in c.fetchall():
-        sig_type, total, wins = row
-        if total > 0:
-            rate = wins / total * 100
-            emoji = "🎯" if sig_type == "underflow" else "🔥" if sig_type == "momentum_chase" else "📊" if sig_type == "combined" else "🔻" if sig_type == "reversal" else "🌟"
-            display_name = sig_type.replace("_", " ")  # avoid Markdown italic break
-            lines.append(f"  {emoji} {display_name}: {wins}/{total} ({rate:.0f}%)")
+    # Per-strategy breakdown — only show if ≥ 3 signals in window
+    c.execute("""
+        SELECT signal_type, COUNT(*),
+               SUM(CASE WHEN entry_price > signal_price THEN 1 ELSE 0 END)
+        FROM signal_tracker
+        WHERE status = 'entered' AND signal_time >= ?
+        GROUP BY signal_type
+        HAVING COUNT(*) >= 3
+    """, (cutoff_7d,))
+    for sig_type, total, wins in c.fetchall():
+        rate = (wins or 0) / total * 100
+        emoji = "🎯" if sig_type == "underflow" else "🔥" if sig_type == "momentum_chase" else "📊" if sig_type == "combined" else "🔻" if sig_type == "reversal" else "🌟"
+        lines.append(f"  {emoji} {sig_type.replace('_', ' ')}: {wins}/{total} ({rate:.0f}%)")
 
     return "\n".join(lines)
 
@@ -1692,16 +1750,16 @@ def score_reversal(coin_data, pool_map, conn):
 
 
 def generate_review_report(conn):
-    """Generate a review report string (for CLI or Telegram)."""
+    """Generate a review report (30-day window) for Telegram /review command."""
     c = conn.cursor()
     now = datetime.now(timezone(timedelta(hours=8)))
     now_str = now.strftime("%Y-%m-%d %H:%M")
+    cutoff_30d = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
 
-    tracked_syms = set()
-    c.execute("SELECT DISTINCT symbol FROM signal_tracker")
-    for row in c.fetchall():
-        tracked_syms.add(row[0])
-
+    # Fetch current prices for tracked symbols
+    tracked_syms = set(
+        row[0] for row in c.execute("SELECT DISTINCT symbol FROM signal_tracker").fetchall()
+    )
     price_map = {}
     for sym in tracked_syms:
         tk = api_get("/fapi/v1/ticker/24hr", {"symbol": sym})
@@ -1709,105 +1767,96 @@ def generate_review_report(conn):
             price_map[sym] = float(tk["lastPrice"])
         time.sleep(0.1)
 
-    # Update pending -> entered or expired
-    for sig_id, sym, sig_type, rh in c.execute("SELECT id, symbol, signal_type, range_high FROM signal_tracker WHERE status='pending'").fetchall():
-        sig_time_row = c.execute("SELECT signal_time FROM signal_tracker WHERE id=?", (sig_id,)).fetchone()
-        if sig_time_row:
-            cutoff = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M")
-            if sig_time_row[0] < cutoff:
-                c.execute("UPDATE signal_tracker SET status='expired', outcome_time=? WHERE id=?", (now_str, sig_id))
-            elif sig_type == "reversal":
-                continue  # Reversal signals don't enter on range_high breakout
-            elif rh > 0 and price_map.get(sym, 0) > rh:
-                c.execute("UPDATE signal_tracker SET status='entered', entry_price=?, entry_time=? WHERE id=?",
-                         (price_map[sym], now_str, sig_id))
+    # Update pending → entered or expired
+    for sig_id, sym, sig_type, rh, sig_time in c.execute(
+        "SELECT id, symbol, signal_type, range_high, signal_time FROM signal_tracker WHERE status='pending'"
+    ).fetchall():
+        if sig_time and sig_time < cutoff_30d:
+            c.execute("UPDATE signal_tracker SET status='expired', outcome_time=? WHERE id=?", (now_str, sig_id))
+        elif sig_type != "reversal" and rh and rh > 0 and price_map.get(sym, 0) > rh:
+            c.execute("UPDATE signal_tracker SET status='entered', entry_price=?, entry_time=? WHERE id=?",
+                      (price_map[sym], now_str, sig_id))
     conn.commit()
 
     lines = [
-        f"Signal Tracker Review",
-        f"{now.strftime('%Y-%m-%d %H:%M')} WIB",
+        f"📊 *Signal Tracker Review* (30 hari)",
+        f"⏰ {now_str} WIB",
+        f"━━━━━━━━━━━━━━━━━━",
         "",
     ]
 
-    c.execute("""SELECT signal_type, COUNT(*),
-                 SUM(CASE WHEN status='entered' THEN 1 ELSE 0 END),
-                 SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END),
-                 SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END)
-                 FROM signal_tracker GROUP BY signal_type""")
+    # --- Per strategy breakdown (30d) ---
+    c.execute("""
+        SELECT signal_type,
+               COUNT(*) AS total,
+               SUM(CASE WHEN status='entered' THEN 1 ELSE 0 END) AS entered,
+               SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END) AS expired,
+               SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+               SUM(CASE WHEN status='entered' AND entry_price > signal_price THEN 1 ELSE 0 END) AS wins,
+               AVG(CASE WHEN status='entered' THEN (entry_price - signal_price) / signal_price * 100 END) AS avg_pnl
+        FROM signal_tracker
+        WHERE signal_time >= ?
+        GROUP BY signal_type
+        ORDER BY entered DESC
+    """, (cutoff_30d,))
 
-    for row in c.fetchall():
-        sig_type, total, entered_count, expired_count, pending_count = row
-        c.execute("""SELECT AVG((entry_price - signal_price) / signal_price * 100)
-                     FROM signal_tracker WHERE signal_type=? AND status='entered'""", (sig_type,))
-        avg_pnl = c.fetchone()[0]
-
-        win_count = c.execute("""SELECT COUNT(*) FROM signal_tracker
-                                 WHERE signal_type=? AND status='entered' AND entry_price > signal_price""",
-                              (sig_type,)).fetchone()[0]
-
-        wr = (win_count / entered_count * 100) if entered_count > 0 else 0
-        pnl_str = f"avg +{avg_pnl:.1f}%" if avg_pnl and avg_pnl > 0 else f"avg {avg_pnl:.1f}%" if avg_pnl else "N/A"
-        lines.append(f"  {sig_type}: {total} total | {entered_count} entered | {pending_count} pending | {expired_count} expired")
-        lines.append(f"    Win rate: {win_count}/{entered_count} ({wr:.0f}%) | {pnl_str}")
-
-    lines.append("")
-    lines.append("Recent Entered (last 7 days):")
-    cutoff_7d = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M")
-    c.execute("""SELECT coin, symbol, signal_type, entry_price, entry_time
-                 FROM signal_tracker WHERE status='entered' AND entry_time > ?
-                 ORDER BY entry_time DESC LIMIT 15""", (cutoff_7d,))
-
-    for row in c.fetchall():
-        coin, sym, sig_type, entry_price, entry_time = row
-        current_price = price_map.get(sym, entry_price)
-        current_pnl = ((current_price - entry_price) / entry_price * 100) if entry_price > 0 else 0
-        # Reversal signals are short: price down = win
-        if sig_type == "reversal":
-            pnl_emoji = "+" if current_pnl < 0 else "-"
-        else:
-            pnl_emoji = "+" if current_pnl > 0 else "-"
-        lines.append(f"  {pnl_emoji} {coin:<8} {sig_type:<18} | Ent: {entry_price:.6f} Now: {current_price:.6f} ({current_pnl:+.1f}%)")
-
-    lines.append("")
-    lines.append("Pending (waiting for breakout):")
-    c.execute("""SELECT coin, signal_type, signal_price, range_high
-                 FROM signal_tracker WHERE status='pending' ORDER BY signal_time DESC LIMIT 10""")
-
-    for row in c.fetchall():
-        coin, sig_type, sig_price, rh = row
-        dist = ((rh - sig_price) / sig_price * 100) if rh > 0 and sig_price > 0 else 0
-        dist_str = f"need +{dist:.1f}%" if dist > 0 else "no range"
-        lines.append(f"  {coin:<8} {sig_type:<18} | Price: {sig_price:.6f} | {dist_str}")
-
-    total_signals = c.execute("SELECT COUNT(*) FROM signal_tracker").fetchone()[0]
-    total_entered = c.execute("SELECT COUNT(*) FROM signal_tracker WHERE status='entered'").fetchone()[0]
-    total_wins = c.execute("SELECT COUNT(*) FROM signal_tracker WHERE status='entered' AND entry_price > signal_price").fetchone()[0]
-    overall_wr = (total_wins / total_entered * 100) if total_entered > 0 else 0
-    c.execute("SELECT AVG((entry_price - signal_price) / signal_price * 100) FROM signal_tracker WHERE status='entered'")
-    overall_avg = c.fetchone()[0]
-
-    lines.append("")
-    lines.append(f"Overall: {total_signals} signals | {total_entered} entered | {total_wins} wins | {overall_wr:.0f}% win rate")
-    if overall_avg:
-        lines.append(f"Avg entry P&L: {overall_avg:+.1f}%")
-
-    # v2: breakdown by trade_state
-    c.execute("""SELECT trade_state, COUNT(*),
-                 SUM(CASE WHEN status='entered' THEN 1 ELSE 0 END),
-                 SUM(CASE WHEN status='entered' AND entry_price > signal_price THEN 1 ELSE 0 END),
-                 AVG(CASE WHEN status='entered' THEN (entry_price - signal_price) / signal_price * 100 END)
-                 FROM signal_tracker
-                 WHERE trade_state IS NOT NULL
-                 GROUP BY trade_state
-                 ORDER BY COUNT(*) DESC""")
-    rows = c.fetchall()
-    if rows:
-        lines.append("")
-        lines.append("By Trade State (v2):")
-        for ts, total, entered, wins, avg_pnl in rows:
+    strategy_rows = c.fetchall()
+    if strategy_rows:
+        lines.append("*Per Strategy (30d):*")
+        for sig_type, total, entered, expired, pending, wins, avg_pnl in strategy_rows:
+            wins = wins or 0
             wr = (wins / entered * 100) if entered else 0
-            pnl_str = f"avg {avg_pnl:+.1f}%" if avg_pnl is not None else "N/A"
-            lines.append(f"  {ts}: {total} total | {entered} entered | {wr:.0f}% WR | {pnl_str}")
+            pnl_str = f"{avg_pnl:+.1f}%" if avg_pnl is not None else "—"
+            emoji = "🎯" if sig_type == "underflow" else "🔥" if sig_type == "momentum_chase" else "📊" if sig_type == "combined" else "🔻" if sig_type == "reversal" else "🌟"
+            lines.append(f"  {emoji} {sig_type.replace('_', ' ')}: {wins}/{entered} WR ({wr:.0f}%) | avg {pnl_str} | {pending} pending")
+        lines.append("")
+
+    # --- Entered signals (30d) with current PnL ---
+    c.execute("""
+        SELECT coin, symbol, signal_type, entry_price, entry_time
+        FROM signal_tracker
+        WHERE status='entered' AND entry_time >= ?
+        ORDER BY entry_time DESC LIMIT 15
+    """, (cutoff_30d,))
+    entered_rows = c.fetchall()
+
+    if entered_rows:
+        lines.append("*Entered (30d):*")
+        for coin, sym, sig_type, entry_price, entry_time in entered_rows:
+            current = price_map.get(sym, entry_price)
+            pnl = ((current - entry_price) / entry_price * 100) if entry_price > 0 else 0
+            if sig_type == "reversal":
+                pnl = -pnl
+            em = "✅" if pnl > 0 else "❌"
+            entry_date = entry_time[:10] if entry_time else "—"
+            lines.append(f"  {em} {coin:<8} {pnl:+.1f}% | {sig_type.replace('_',' ')} | {entry_date}")
+        lines.append("")
+
+    # --- Pending signals with age ---
+    c.execute("""
+        SELECT coin, signal_type, signal_price, range_high, signal_time
+        FROM signal_tracker WHERE status='pending'
+        ORDER BY signal_time DESC LIMIT 10
+    """)
+    pending_rows = c.fetchall()
+
+    if pending_rows:
+        lines.append("*Pending (menunggu breakout):*")
+        for coin, sig_type, sig_price, rh, sig_time in pending_rows:
+            dist = ((rh - sig_price) / sig_price * 100) if rh and sig_price > 0 else 0
+            try:
+                age_days = (now - datetime.strptime(sig_time[:16], "%Y-%m-%d %H:%M").replace(tzinfo=timezone(timedelta(hours=8)))).days
+            except Exception:
+                age_days = 0
+            lines.append(f"  {coin:<8} need +{dist:.1f}% | {age_days}d ago | {sig_type.replace('_',' ')}")
+        lines.append("")
+
+    # --- All-time summary (1 line) ---
+    total_all = c.execute("SELECT COUNT(*) FROM signal_tracker").fetchone()[0]
+    entered_all = c.execute("SELECT COUNT(*) FROM signal_tracker WHERE status='entered'").fetchone()[0]
+    wins_all = c.execute("SELECT COUNT(*) FROM signal_tracker WHERE status='entered' AND entry_price > signal_price").fetchone()[0]
+    wr_all = (wins_all / entered_all * 100) if entered_all else 0
+    lines.append(f"All-time: {total_all} signals | {entered_all} entered | {wr_all:.0f}% WR")
 
     return "\n".join(lines)
 
@@ -2193,19 +2242,33 @@ def check_telegram_commands(conn):
                 LAST_TG_UPDATE_ID = update["update_id"]
             elif text == "/oi":
                 if not review_sent:
-                    print("[TG] /oi received, triggering OI scan...")
-                    send_telegram_plain("⏳ Menjalankan OI scan... (tunggu ~60 detik)")
-                    try:
-                        subprocess.run(
-                            [sys.executable, __file__, "oi"],
-                            timeout=300,
+                    print("[TG] /oi received")
+                    # Skip if cron is about to run (within 5 min before :30)
+                    now_min = datetime.now(timezone.utc).minute
+                    if 25 <= now_min <= 34:
+                        mins_left = (30 - now_min) if now_min < 30 else (90 - now_min)
+                        send_telegram_plain(
+                            f"⏰ Cron OI {'dalam ' + str(mins_left) + ' menit' if now_min < 30 else 'baru saja berjalan'}. "
+                            f"Tidak perlu force run."
                         )
-                        print("[TG] /oi scan complete")
-                    except subprocess.TimeoutExpired:
-                        send_telegram_plain("⚠️ OI scan timeout setelah 5 menit.")
-                    except Exception as e:
-                        print(f"[TG] /oi scan failed: {e}")
-                        send_telegram_plain(f"❌ OI scan gagal: {e}")
+                    else:
+                        # Save update_id to DB BEFORE subprocess so OI scan won't re-process this command
+                        LAST_TG_UPDATE_ID = update["update_id"]
+                        set_app_state(conn, "last_tg_update_id", str(LAST_TG_UPDATE_ID))
+                        pending_msg_id = send_telegram_temp("⏳ Menjalankan OI scan... (tunggu ~60 detik)")
+                        try:
+                            subprocess.run(
+                                [sys.executable, __file__, "oi"],
+                                timeout=300,
+                            )
+                            print("[TG] /oi scan complete")
+                        except subprocess.TimeoutExpired:
+                            send_telegram_plain("⚠️ OI scan timeout setelah 5 menit.")
+                        except Exception as e:
+                            print(f"[TG] /oi scan failed: {e}")
+                            send_telegram_plain(f"❌ OI scan gagal: {e}")
+                        finally:
+                            delete_telegram_message(pending_msg_id)
                     review_sent = True
                 LAST_TG_UPDATE_ID = update["update_id"]
             elif text == "/help":
@@ -2633,6 +2696,8 @@ def main():
             prior_3h = get_prior_snapshot(conn, sym, 3)
             cls = classify_trade_state(d, prior_1h, prior_3h, pool_row)
             cls["origin_strategies"] = origin_map.get(sym, [])
+            if cls["trade_state"] == "EARLY_UNDERFLOW":
+                cls["consecutive_eu_hours"] = get_consecutive_eu_hours(conn, sym)
             lifecycle_results.append((d, cls))
 
             # Persist current snapshot
@@ -2693,15 +2758,27 @@ def main():
             buckets[bucket_of(cls["trade_state"])].append((d, cls))
 
         # Sort: actionable/alert by entry_readiness_score desc, late by price_24h desc
+        _POOL_STATE_WEIGHT = {
+            "ARMED_INSIDE_RANGE": 3,
+            "WAKING_UP": 2,
+            "SLEEPING_ACCUMULATION": 1,
+        }
         def sort_actionable(item):
             d, cls = item
             pool = pool_v2_map.get(d["sym"], {})
             return pool.get("entry_readiness_score") or 0
+        def sort_eu_priority(item):
+            d, cls = item
+            pool = pool_v2_map.get(d["sym"]) or {}
+            consecutive = cls.get("consecutive_eu_hours", 0)
+            pool_w = _POOL_STATE_WEIGHT.get(pool.get("pool_setup_state", ""), 0)
+            readiness = pool.get("entry_readiness_score", 0) or 0
+            return (consecutive * 2 + pool_w, readiness)
         def sort_late(item):
             d, _cls = item
             return d.get("px_chg") or 0
         buckets["ACTIONABLE"].sort(key=sort_actionable, reverse=True)
-        buckets["ALERT"].sort(key=sort_actionable, reverse=True)
+        buckets["ALERT"].sort(key=sort_eu_priority, reverse=True)
         buckets["ACTIVE_LATE"].sort(key=sort_late, reverse=True)
         buckets["AVOID"].sort(key=sort_late, reverse=True)
 
@@ -2735,7 +2812,23 @@ def main():
 
             line2 = f"   {trans} via {via} ▸ {action}"
 
-            return [line1, line2]
+            lines_out = [line1, line2]
+
+            # Line 3 (EARLY_UNDERFLOW only): consecutive build hours + pool state + OI 3h
+            if state == "EARLY_UNDERFLOW":
+                consec = cls.get("consecutive_eu_hours")
+                pool_state_raw = (pool_row or {}).get("pool_setup_state", "")
+                pool_label = pool_state_raw.replace("_", " ").title() if pool_state_raw else "—"
+                oi_3h = cls.get("oi_3h_change_pct")
+                parts = []
+                if consec:
+                    parts.append(f"⏱ {consec}h build")
+                parts.append(f"Pool: {pool_label}")
+                if oi_3h is not None:
+                    parts.append(f"OI 3h: {oi_3h:+.0f}%")
+                lines_out.append(f"   {' | '.join(parts)}")
+
+            return lines_out
 
         lines = [
             f"🏦 **Smart Money Radar** - Hourly Progression",
@@ -2744,11 +2837,23 @@ def main():
         ]
 
         section_meta = [
-            ("ACTIONABLE",   "📍", "ACTIONABLE NOW",       "READY / TRIGGERED",                       10),
-            ("ALERT",        "🟠", "ALERT / NEXT SETUP",   "Early underflow / building",              8),
-            ("ACTIVE_LATE",  "🔥", "ACTIVE BUT LATE",      "Trending or extended — no fresh chase",   8),
-            ("AVOID",        "⚠️", "AVOID / DEPRIORITIZE", "No confirmation / covering / exit",       6),
+            ("ACTIONABLE",   "📍", "ACTIONABLE NOW",       "READY / TRIGGERED",              10),
+            ("ALERT",        "🟠", "ALERT / NEXT SETUP",   "Early underflow / building",      8),
+            ("ACTIVE_LATE",  "🔥", "ACTIVE TREND",         "In markup — hold/manage only",    5),
         ]
+
+        # Filter ACTIVE_LATE to only ACTIVE_TREND (hide LATE_LONG and LATE_SHORT)
+        buckets["ACTIVE_LATE"] = [
+            (d, cls) for d, cls in buckets["ACTIVE_LATE"]
+            if cls["trade_state"] == "ACTIVE_TREND"
+        ]
+
+        def _is_high_watch(d, cls):
+            pool = pool_v2_map.get(d["sym"]) or {}
+            return (
+                cls.get("consecutive_eu_hours", 0) >= 3
+                or pool.get("pool_setup_state") == "ARMED_INSIDE_RANGE"
+            )
 
         rendered_any = False
         for bucket_key, emoji, title, tagline, limit in section_meta:
@@ -2757,12 +2862,30 @@ def main():
                 continue
             rendered_any = True
             lines.append("")
-            lines.append(f"{emoji} **{title}** ({len(items)}) — {tagline}")
-            for d, cls in items[:limit]:
-                pool_row = pool_v2_map.get(d["sym"])
-                lines.extend(render_token_block(d, cls, pool_row))
-            if len(items) > limit:
-                lines.append(f"   ... +{len(items) - limit} more in {title}")
+
+            if bucket_key == "ALERT":
+                high = [(d, cls) for d, cls in items if _is_high_watch(d, cls)]
+                watching = [(d, cls) for d, cls in items if not _is_high_watch(d, cls)]
+                lines.append(f"{emoji} **{title}** ({len(items)}) — {tagline}")
+                if high:
+                    lines.append(f"⭐ *HIGH WATCH* ({len(high)}) — OI build persisten / siap breakout")
+                    for d, cls in high[:6]:
+                        pool_row = pool_v2_map.get(d["sym"])
+                        lines.extend(render_token_block(d, cls, pool_row))
+                if watching:
+                    lines.append(f"📋 *WATCHING* ({len(watching)}) — OI baru mulai / belum konfirmasi")
+                    for d, cls in watching[:6]:
+                        pool_row = pool_v2_map.get(d["sym"])
+                        lines.extend(render_token_block(d, cls, pool_row))
+                    if len(watching) > 6:
+                        lines.append(f"   ... +{len(watching) - 6} more watching")
+            else:
+                lines.append(f"{emoji} **{title}** ({len(items)}) — {tagline}")
+                for d, cls in items[:limit]:
+                    pool_row = pool_v2_map.get(d["sym"])
+                    lines.extend(render_token_block(d, cls, pool_row))
+                if len(items) > limit:
+                    lines.append(f"   ... +{len(items) - limit} more in {title}")
 
         if not rendered_any:
             lines.append("(No tokens classified this hour.)")
