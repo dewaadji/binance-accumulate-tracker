@@ -2748,43 +2748,37 @@ def main():
         if not rendered_any:
             lines.append("(No tokens classified this hour.)")
 
-        # PREV WATCHED: tokens that were EARLY_UNDERFLOW in last 6h but not in this run
-        current_syms = {d["sym"] for d, _ in lifecycle_results}
+        # PREV WATCHED: tokens that were EARLY_UNDERFLOW in last 6h but have since changed state
         cutoff_6h = (datetime.now(timezone.utc) - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%S")
 
+        # Find tokens whose latest snapshot is NOT EARLY_UNDERFLOW, but had EARLY_UNDERFLOW in last 6h
         prev_rows = conn.execute("""
-            SELECT symbol, trade_state, timestamp
-            FROM hourly_token_snapshots
-            WHERE trade_state = 'EARLY_UNDERFLOW'
-              AND timestamp >= ?
-              AND symbol NOT IN ({})
-            GROUP BY symbol
-            HAVING timestamp = MAX(timestamp)
-            ORDER BY timestamp DESC
-        """.format(",".join("?" * len(current_syms)) if current_syms else "'__none__'"),
-            ([cutoff_6h] + list(current_syms)) if current_syms else [cutoff_6h]
-        ).fetchall()
+            SELECT h1.symbol, h1.trade_state AS latest_state
+            FROM hourly_token_snapshots h1
+            WHERE h1.timestamp = (
+                SELECT MAX(h2.timestamp) FROM hourly_token_snapshots h2
+                WHERE h2.symbol = h1.symbol
+            )
+            AND h1.trade_state != 'EARLY_UNDERFLOW'
+            AND h1.symbol IN (
+                SELECT DISTINCT symbol FROM hourly_token_snapshots
+                WHERE trade_state = 'EARLY_UNDERFLOW' AND timestamp >= ?
+            )
+            ORDER BY h1.timestamp DESC
+        """, (cutoff_6h,)).fetchall()
 
         if prev_rows:
-            # For each, get their latest trade_state (may have changed since EARLY_UNDERFLOW)
             prev_lines = []
             for row in prev_rows:
                 sym = row["symbol"]
-                latest = conn.execute("""
-                    SELECT trade_state, timestamp FROM hourly_token_snapshots
-                    WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1
-                """, (sym,)).fetchone()
-                latest_state = latest["trade_state"] if latest else row["trade_state"]
+                latest_state = row["latest_state"]
 
-                # Label based on latest state
-                if latest_state in ("ACTIVE_TREND", "LATE_LONG", "TRIGGERED_LONG"):
+                if latest_state in ("ACTIVE_TREND", "LATE_LONG", "LATE_SHORT"):
                     label = "sudah lari ❌ missed"
-                elif latest_state in ("NO_CONFIRMATION", "INVALIDATED", "SHORT_COVERING_ONLY"):
+                elif latest_state in ("NO_CONFIRMATION", "INVALIDATED", "SHORT_COVERING_ONLY", "DISTRIBUTION_RISK", "EXIT_WARNING"):
                     label = "OI turun, skip"
-                elif latest_state in ("READY_LONG", "READY_SHORT", "TRIGGERED_SHORT"):
-                    label = "lihat ALERT/ACTIONABLE ✅"
-                elif latest_state == "EARLY_UNDERFLOW":
-                    label = "masih building"
+                elif latest_state in ("READY_LONG", "READY_SHORT", "TRIGGERED_LONG", "TRIGGERED_SHORT"):
+                    label = "lihat ACTIONABLE ✅"
                 else:
                     label = latest_state.lower().replace("_", " ")
 
