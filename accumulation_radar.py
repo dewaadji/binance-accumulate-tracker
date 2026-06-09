@@ -18,6 +18,7 @@ import json
 import os
 import sys
 import time
+import subprocess
 import requests
 import sqlite3
 from datetime import datetime, timezone, timedelta
@@ -2190,9 +2191,27 @@ def check_telegram_commands(conn):
                         send_telegram_plain("Error generating review report. Check logs.")
                     review_sent = True
                 LAST_TG_UPDATE_ID = update["update_id"]
+            elif text == "/oi":
+                if not review_sent:
+                    print("[TG] /oi received, triggering OI scan...")
+                    send_telegram_plain("⏳ Menjalankan OI scan... (tunggu ~60 detik)")
+                    try:
+                        subprocess.run(
+                            [sys.executable, __file__, "oi"],
+                            timeout=300,
+                        )
+                        print("[TG] /oi scan complete")
+                    except subprocess.TimeoutExpired:
+                        send_telegram_plain("⚠️ OI scan timeout setelah 5 menit.")
+                    except Exception as e:
+                        print(f"[TG] /oi scan failed: {e}")
+                        send_telegram_plain(f"❌ OI scan gagal: {e}")
+                    review_sent = True
+                LAST_TG_UPDATE_ID = update["update_id"]
             elif text == "/help":
                 send_telegram_plain(
                     "Commands:\n"
+                    "/oi - Force run OI scan sekarang\n"
                     "/btc - Today's BTC bias brief\n"
                     "/review - Signal tracker performance report\n"
                     "/help - Show this help message"
@@ -2752,7 +2771,9 @@ def main():
         cutoff_6h = (datetime.now(timezone.utc) - timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%S")
 
         # Find tokens whose latest snapshot is NOT EARLY_UNDERFLOW, but had EARLY_UNDERFLOW in last 6h
-        prev_rows = conn.execute("""
+        _prev_cur = conn.cursor()
+        _prev_cur.row_factory = sqlite3.Row
+        prev_rows = _prev_cur.execute("""
             SELECT h1.symbol, h1.trade_state AS latest_state
             FROM hourly_token_snapshots h1
             WHERE h1.timestamp = (
@@ -2810,6 +2831,15 @@ def main():
         print("\n✅ Review complete")
         conn.close()
         return
+
+    if mode == "listen":
+        print("[listen] Telegram command listener started (polling every 10s)")
+        while True:
+            try:
+                check_telegram_commands(conn)
+            except Exception as e:
+                print(f"[listen] Error: {e}")
+            time.sleep(10)
 
     conn.close()
     print("\n✅ Done")
