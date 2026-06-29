@@ -2326,7 +2326,7 @@ def main():
             else:
                 send_telegram("❌ Pool scan gagal & watchlist kosong. OI scan dilewati.")
     
-    if mode in ("full", "oi"):
+    if mode in ("full", "oi", "setup"):
         # === Combined scan: OI + funding + accumulation in one pass ===
         watchlist = load_watchlist_symbols(conn)
         watchlist_set = set(watchlist)
@@ -2939,6 +2939,26 @@ def main():
         tracking_recap = build_tracking_recap(conn)
         if tracking_recap:
             report += "\n" + tracking_recap
+
+        # === Generate actionable setups for 'setup' mode (every 6h) ===
+        if mode == "setup":
+            try:
+                import setup_engine
+                setup_engine.set_fetch_fn(
+                    lambda sym, iv, lim: api_get("/fapi/v1/klines", {
+                        "symbol": sym, "interval": iv, "limit": lim
+                    })
+                )
+                setup_engine.clear_caches()
+                setups = setup_engine.generate_setups(
+                    lifecycle_results, coin_data, pool_v2_map
+                )
+                setup_block = setup_engine.format_setup_report(setups)
+                if setup_block:
+                    report += "\n" + setup_block
+            except Exception as e:
+                print(f"[setup] Error: {e}")
+
         send_telegram(report)
         if TG_POLL_COMMANDS_IN_OI:
             check_telegram_commands(conn)
