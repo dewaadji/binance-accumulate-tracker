@@ -26,6 +26,7 @@ RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin app \
   && chown -R app:app /data
 
 COPY --chown=app:app accumulation_radar.py /app/accumulation_radar.py
+COPY --chown=app:app setup_engine.py /app/setup_engine.py
 COPY --chown=app:app crontab /etc/supercronic/crontab
 COPY --chown=app:app docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
