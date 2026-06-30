@@ -51,10 +51,11 @@ No `requirements.txt`, no test suite, no lint config, no CI/CD.
 |------|------|---------|
 | `pool` | Daily | Full market scan (~400+ perps) → find accumulation candidates → save to SQLite |
 | `oi` | Hourly | Fetch funding/ticker/OI data → score three strategies → send Telegram report |
+| `setup` | Every 6h (05,11,17,23 UTC) | Baca dari DB (hourly snapshots) → lifecycle filter → zone detection → reaction analysis (5m) → entry/SL/TP → Telegram sinyal trade PRIME/WATCH |
 | `btc` | Daily (00:30 UTC) | Multi-factor BTC bias analysis → save + send daily brief |
 | `sync` | Every 12h | Sync all active trades with current prices → update statuses |
 | `perps` | On-demand | Generate monthly perps trade statistics |
-| `listen` | Always on | Long-poll Telegram for /review, /limit, /perps, /help commands
+| `listen` | Always on | Long-poll Telegram for /review, /limit, /setup, /perps, /help commands
 
 ### Trade Journal
 
@@ -67,6 +68,9 @@ Trade journal data is stored as JSON files under `data/journal/YYYY-MM.json` (on
 
 | Command | Description |
 |---------|-------------|
+| `/oi` | Force run OI scan sekarang |
+| `/setup` | Force run sinyal trade scan (baca dari DB, zone detection, entry/SL/TP) |
+| `/btc` | Today's BTC bias brief |
 | `/limit <long|short> <SYMBOL> <entry> invalid <price> sl <price> tp1 <price> [tp2...]` | Add a new limit trade setup |
 | `/perps` | Show current month perps trade statistics |
 | `/review` | Signal tracker performance report |
@@ -92,7 +96,7 @@ python3 accumulation_radar.py full   # both
 docker compose up -d --build
 ```
 
-Container runs `docker-entrypoint.sh`: one-time pool scan → supercronic starts (pool at 00:00 UTC, oi at :30 hourly). Logs at `./data/logs/`.
+Container runs `docker-entrypoint.sh`: one-time pool scan → supercronic starts (pool at 00:00 UTC, oi at :30 hourly, setup at 05/11/17/23 UTC, sync every 12h). Logs at `./data/logs/`.
 
 ## Testing & Linting
 
@@ -107,12 +111,16 @@ python3 accumulation_radar.py oi   # quickest path to validate changes
 ### Data Flow
 
 1. **Pool scan** (`pool`): Fetch all USDT perpetuals → download 180 daily candles each → analyze for accumulation (sideways range, volume, slope, market cap) → score → save to `watchlist` table → Telegram report.
-2. **OI scan** (`oi`): Load watchlist from DB → fetch 24h tickers + funding rates → fetch OI history for pool + top-100 volume → real market caps from Binance Spot → CoinGecko trending → score three strategies → Telegram report.
+2. **OI scan** (`oi`): Load watchlist from DB → fetch 24h tickers + funding rates → fetch OI history for pool + top-100 volume → real market caps from Binance Spot → CoinGecko trending → score three strategies → lifecycle classification → save hourly snapshots → Telegram report.
+3. **Setup scan** (`setup`): Baca dari `hourly_token_snapshots` sejak `last_setup_run` → rekonstruksi `coin_data` + `classify_trade_state()` dari DB (tanpa fetch ulang ticker/funding/OI) → filter lifecycle state + volume ≥ $1M → fetch 4h klines (zone/swing detection) → discard fallback (no zone) → reaction detection 5m (BOUNCE/LIQUIDITY_GRAB/REJECT/RETESTING/breakdown) → entry/SL (berdasarkan reaction type) → TP dari swing point terdekat → score tradeability (0-100) → label PRIME (≥75 & confirmed) / WATCH → Telegram.
 
 ### Database Schema (SQLite)
 
-- **`watchlist`**: `symbol` (PK), `coin`, `added_date`, `sideways_days`, `range_pct`, `avg_vol`, `low_price`, `high_price`, `current_price`, `score`, `status` (watching/removed/breakout), `last_oi_alert`, `notes`
+- **`watchlist`**: `symbol` (PK), `coin`, `added_date`, `sideways_days`, `range_pct`, `avg_vol`, `low_price`, `high_price`, `current_price`, `score`, `status` (watching/removed/breakout), `last_oi_alert`, `notes`, plus v2 fields (`breakout_state`, `pool_setup_state`, `pool_quality_score`, `entry_readiness_score`, etc.)
 - **`alerts`**: `id` (PK autoincrement), `symbol`, `alert_type`, `alert_time`, `price`, `oi_delta_pct`, `vol_ratio`, `details`
+- **`signal_tracker`**: `id`, `symbol`, `coin`, `signal_type`, `signal_time`, `signal_price`, `status`, `pnl_pct`, `score`, `trade_state`, `action_label`, dll.
+- **`hourly_token_snapshots`**: `id`, `symbol`, `timestamp`, `price`, `price_24h_change_pct`, `open_interest`, `oi_change_pct_from_baseline`, `funding_rate`, `quote_volume_24h`, `trade_state`, `action`, `origin_strategies`, dll.
+- **`app_state`**: key-value store untuk state persistence (e.g. `last_setup_run`, `last_tg_update_id`)
 
 ### Market Cap Fallback Chain
 
@@ -168,6 +176,9 @@ python3 accumulation_radar.py pool
 
 # Run hourly OI scan
 python3 accumulation_radar.py oi
+
+# Run trade setup scan (baca dari DB, zone entry/SL/TP)
+python3 accumulation_radar.py setup
 
 # Run BTC daily brief
 python3 accumulation_radar.py btc

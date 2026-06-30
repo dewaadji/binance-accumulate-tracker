@@ -2271,10 +2271,30 @@ def check_telegram_commands(conn):
                             delete_telegram_message(pending_msg_id)
                     review_sent = True
                 LAST_TG_UPDATE_ID = update["update_id"]
+            elif text == "/setup":
+                if not review_sent:
+                    print("[TG] /setup received")
+                    pending_msg_id = send_telegram_temp("⏳ Menjalankan sinyal trade scan... (tunggu ~2-3 menit)")
+                    try:
+                        subprocess.run(
+                            [sys.executable, __file__, "setup"],
+                            timeout=600,
+                        )
+                        print("[TG] /setup scan complete")
+                    except subprocess.TimeoutExpired:
+                        send_telegram_plain("⚠️ Setup scan timeout setelah 10 menit.")
+                    except Exception as e:
+                        print(f"[TG] /setup scan failed: {e}")
+                        send_telegram_plain(f"❌ Setup scan gagal: {e}")
+                    finally:
+                        delete_telegram_message(pending_msg_id)
+                    review_sent = True
+                LAST_TG_UPDATE_ID = update["update_id"]
             elif text == "/help":
                 send_telegram_plain(
                     "Commands:\n"
                     "/oi - Force run OI scan sekarang\n"
+                    "/setup - Force run sinyal trade scan\n"
                     "/btc - Today's BTC bias brief\n"
                     "/review - Signal tracker performance report\n"
                     "/help - Show this help message"
@@ -2297,6 +2317,364 @@ def review_signals(conn):
     return c.execute("SELECT COUNT(*) FROM signal_tracker").fetchone()[0]
 
 
+# ═══════════════════════════════════════════════════════════════
+# Setup mode — baca dari hourly_token_snapshots, bukan fetch API
+# ═══════════════════════════════════════════════════════════════
+
+_KLINE_5M_CACHE = {}
+
+def _get_klines_5m(symbol, limit=48):
+    cache_key = f"{symbol}:{limit}"
+    if cache_key in _KLINE_5M_CACHE:
+        return _KLINE_5M_CACHE[cache_key]
+    result = api_get("/fapi/v1/klines", {"symbol": symbol, "interval": "5m", "limit": limit})
+    if isinstance(result, list):
+        _KLINE_5M_CACHE[cache_key] = result
+    return result
+
+
+def _detect_reaction(symbol, zone, direction, current_price):
+    """Detect price reaction at supply/demand zone using 5m klines.
+    
+    Returns dict with reaction_type, entry_price, stop_loss, confidence (0-3).
+    reaction_type: BOUNCE | LIQUIDITY_GRAB | REJECT | RETESTING | BREAKDOWN | BREAKOUT | NONE
+    """
+    klines = _get_klines_5m(symbol, limit=48)
+    if not klines or len(klines) < 12:
+        return {"reaction_type": "NONE", "entry_price": current_price,
+                "stop_loss": zone.get("bottom") if direction == "long" else zone.get("top"),
+                "confidence": 0}
+
+    zone_top, zone_bottom = zone["top"], zone["bottom"]
+    zone_mid = (zone_top + zone_bottom) / 2
+    recent = klines[-24:]
+    closes = [float(k[4]) for k in recent]
+    highs = [float(k[2]) for k in recent]
+    lows = [float(k[3]) for k in recent]
+    opens = [float(k[1]) for k in recent]
+    body_sizes = [abs(float(k[4]) - float(k[1])) for k in recent]
+    avg_body = sum(body_sizes) / len(body_sizes) if body_sizes else 0.0001
+
+    if direction == "long":
+        candles_in_zone = [i for i in range(len(recent))
+                           if zone_bottom * 0.98 <= lows[i] <= zone_top * 1.02]
+        if not candles_in_zone:
+            return {"reaction_type": "RETESTING", "entry_price": current_price,
+                    "stop_loss": zone_bottom * 0.98, "confidence": 1}
+        last_12 = recent[-12:]
+        for i in range(len(last_12)):
+            low_i = float(last_12[i][3])
+            close_i = float(last_12[i][4])
+            if low_i < zone_bottom * 0.98 and close_i >= zone_bottom * 0.99:
+                return {"reaction_type": "LIQUIDITY_GRAB", "entry_price": close_i * 1.001,
+                        "stop_loss": low_i * 0.99, "confidence": 3}
+        for i in range(len(last_12)):
+            open_i = float(last_12[i][1])
+            close_i = float(last_12[i][4])
+            low_i = float(last_12[i][3])
+            body = abs(close_i - open_i)
+            if (zone_bottom * 0.99 <= open_i <= zone_top * 1.01
+                    and close_i > open_i and body > avg_body * 1.5 and close_i > zone_mid):
+                return {"reaction_type": "BOUNCE",
+                        "entry_price": open_i + (close_i - open_i) * 0.5,
+                        "stop_loss": low_i * 0.99, "confidence": 2}
+        last_6 = recent[-6:]
+        if all(float(k[4]) < zone_bottom for k in last_6):
+            return {"reaction_type": "BREAKDOWN", "entry_price": 0, "stop_loss": 0, "confidence": 0}
+        return {"reaction_type": "RETESTING", "entry_price": current_price,
+                "stop_loss": zone_bottom * 0.97, "confidence": 1}
+    else:
+        candles_in_zone = [i for i in range(len(recent))
+                           if zone_bottom * 0.98 <= highs[i] <= zone_top * 1.02]
+        if not candles_in_zone:
+            return {"reaction_type": "RETESTING", "entry_price": current_price,
+                    "stop_loss": zone_top * 1.02, "confidence": 1}
+        last_12 = recent[-12:]
+        for i in range(len(last_12)):
+            high_i = float(last_12[i][2])
+            close_i = float(last_12[i][4])
+            if high_i > zone_top * 1.02 and close_i <= zone_top * 1.01:
+                return {"reaction_type": "LIQUIDITY_GRAB", "entry_price": close_i * 0.999,
+                        "stop_loss": high_i * 1.01, "confidence": 3}
+        for i in range(len(last_12)):
+            open_i = float(last_12[i][1])
+            close_i = float(last_12[i][4])
+            high_i = float(last_12[i][2])
+            body = abs(close_i - open_i)
+            if (zone_bottom * 0.99 <= open_i <= zone_top * 1.01
+                    and close_i < open_i and body > avg_body * 1.5 and close_i < zone_mid):
+                return {"reaction_type": "REJECT",
+                        "entry_price": open_i - (open_i - close_i) * 0.5,
+                        "stop_loss": high_i * 1.01, "confidence": 2}
+        last_6 = recent[-6:]
+        if all(float(k[4]) > zone_top for k in last_6):
+            return {"reaction_type": "BREAKOUT", "entry_price": 0, "stop_loss": 0, "confidence": 0}
+        return {"reaction_type": "RETESTING", "entry_price": current_price,
+                "stop_loss": zone_top * 1.03, "confidence": 1}
+
+
+def _score_tradeability(zone_strength, reaction_type, reaction_conf, confirm_15m,
+                        rr_ratio, volume, entry_readiness):
+    z_map = {10: 15, 8: 12, 6: 10, 4: 5, 2: 2}
+    z_score = next((pts for thr, pts in sorted(z_map.items(), reverse=True) if zone_strength >= thr), 0)
+    r_map = {"LIQUIDITY_GRAB": 15, "BOUNCE": 12, "REJECT": 12, "RETESTING": 5, "NONE": 0}
+    r_score = r_map.get(reaction_type, 0) + reaction_conf * 2
+    c_map = {"confirmed": 15, "retest+bounce": 12, "retest+reject": 10,
+             "retesting": 5, "no confirmation": 0, "N/A (fallback)": 0}
+    c_score = c_map.get(confirm_15m, 0)
+    rr_score = 10 if rr_ratio >= 2.0 else 7 if rr_ratio >= 1.5 else 5 if rr_ratio >= 1.0 else 2 if rr_ratio >= 0.5 else 0
+    vol_score = 10 if volume >= 5_000_000 else 5
+    er_score = min(entry_readiness / 100 * 15, 15) if entry_readiness else 0
+    bonus = 5 if (reaction_type == "LIQUIDITY_GRAB" and confirm_15m == "confirmed") else 0
+    return min(z_score + r_score + c_score + rr_score + vol_score + er_score + bonus, 100)
+
+
+_REACTION_LABEL = {
+    "LIQUIDITY_GRAB": "\U0001f3af Stop hunt",
+    "BOUNCE": "\u2b06\ufe0f Bounce",
+    "REJECT": "\u2b07\ufe0f Reject",
+    "RETESTING": "\u23f3 Retesting",
+    "NONE": "\u2022",
+}
+
+
+def _fmt_price(p):
+    if p >= 1000: return f"${p:,.0f}"
+    if p >= 1: return f"${p:.2f}"
+    if p >= 0.01: return f"${p:.4f}"
+    return f"${p:.8f}"
+
+
+def _append_setup(lines, s):
+    emoji_d = "\U0001f7e2" if s["direction"] == "long" else "\U0001f53b"
+    lines.append("")
+    lines.append(f"{emoji_d} **{s['coin']}** {s['direction'].upper()} \u2014 {s['state'].replace('_',' ')}")
+    ep = _fmt_price
+    lines.append(f"   Entry: {ep(s['entry_price'])} | SL: {ep(s['stop_loss'])} ({s['sl_pct']:.1f}%)")
+    lines.append(f"   TP: {ep(s['tp_price'])} ({s['tp_pct']:.1f}%) | R:R {s['rr_ratio']}")
+    reaction_label = _REACTION_LABEL.get(s["reaction_type"], s["reaction_type"])
+    ci = "\u2705" if s["fifteen_m"] == "confirmed" else "\U0001f7e2" if "bounce" in s["fifteen_m"] or "reject" in s["fifteen_m"] else "\u23f3" if "retest" in s["fifteen_m"] else "\u274c"
+    lines.append(f"   Reaksi: {reaction_label} | 15m: {ci}{s['fifteen_m']}")
+    z = s["zone"]
+    ztype = "Demand Zone" if s["direction"] == "long" else "Supply Zone"
+    fi = z.get("_freshness", "normal")
+    sl = z.get("_strength_label", "medium")
+    lines.append(f"   {ztype}: {ep(z['bottom'])}-{ep(z['top'])} ({fi}, {sl})")
+    label_str = "\u2b50 PRIME" if s["label"] == "PRIME" else "\U0001f441 WATCH"
+    lines.append(f"   Score: {s['score']} | Label: {label_str}")
+
+
+def _format_setup_telegram(setups):
+    now_wib = datetime.now(timezone(timedelta(hours=8)))
+    lines = [
+        f"\U0001f3e6 **Sinyal Trade** \u2014 {now_wib.strftime('%Y-%m-%d %H:%M')} WIB",
+        "\u2501" * 22,
+    ]
+    prime = [s for s in setups if s["label"] == "PRIME"]
+    watch = [s for s in setups if s["label"] == "WATCH"]
+    if prime:
+        lines.append("")
+        lines.append(f"\u2b50 **PRIME** ({len(prime)}) \u2014 Siap entry, konfirmasi kuat")
+        for s in prime:
+            _append_setup(lines, s)
+    if watch:
+        lines.append("")
+        lines.append(f"\U0001f441 **WATCH** ({len(watch)}) \u2014 Menunggu konfirmasi")
+        for s in watch:
+            _append_setup(lines, s)
+    lines.append("")
+    lines.append(f"\U0001f4ca {len(setups)} total | Score \u2265 75 + confirmed = PRIME")
+    return "\n".join(lines)
+
+
+def run_setup_from_db(conn):
+    global _KLINE_5M_CACHE
+    _KLINE_5M_CACHE = {}
+    
+    last_run_str = get_app_state(conn, "last_setup_run", "")
+    if last_run_str:
+        try:
+            last_run = datetime.fromisoformat(last_run_str)
+        except Exception:
+            last_run = datetime.now(timezone.utc) - timedelta(hours=6)
+    else:
+        last_run = datetime.now(timezone.utc) - timedelta(hours=6)
+    now_utc = datetime.now(timezone.utc)
+    cutoff_str = last_run.strftime("%Y-%m-%dT%H:%M:%S")
+
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT symbol FROM hourly_token_snapshots WHERE timestamp >= ?", (cutoff_str,))
+    all_symbols = [row[0] for row in c.fetchall()]
+
+    if not all_symbols:
+        print("[setup] No new symbols since last run")
+        send_telegram_plain("\U0001f4ad Tidak ada token baru sejak cron setup terakhir.")
+        set_app_state(conn, "last_setup_run", now_utc.strftime("%Y-%m-%dT%H:%M:%S"))
+        return
+
+    print(f"[setup] {len(all_symbols)} symbols found since {cutoff_str}")
+
+    c.row_factory = sqlite3.Row
+    pool_v2_map = {}
+    for row in c.execute("""SELECT symbol, low_price, high_price, current_price,
+                                 sideways_days, range_pct, avg_vol, vol_breakout,
+                                 breakout_state, pool_setup_state,
+                                 distance_to_high_pct, range_position_pct,
+                                 pool_quality_score, entry_readiness_score
+                          FROM watchlist"""):
+        pool_v2_map[row["symbol"]] = dict(row)
+
+    lifecycle_results = []
+    for sym in all_symbols:
+        prior_1h = get_prior_snapshot(conn, sym, 1)
+        prior_3h = get_prior_snapshot(conn, sym, 3)
+        row = c.execute("""SELECT * FROM hourly_token_snapshots
+                           WHERE symbol = ? ORDER BY timestamp DESC LIMIT 1""", (sym,)).fetchone()
+        if not row:
+            continue
+        snap = dict(row)
+        pool_row = pool_v2_map.get(sym)
+        current_oi = snap.get("open_interest") or 0
+        prior_oi = prior_1h.get("open_interest") if prior_1h else None
+        d1h = ((current_oi - prior_oi) / prior_oi * 100) if (prior_oi and prior_oi > 0) else 0
+        coin = sym.replace("USDT", "")
+        coin_data = {
+            "sym": sym, "coin": coin,
+            "price": snap.get("price") or 0,
+            "px_chg": snap.get("price_24h_change_pct") or 0,
+            "vol": snap.get("quote_volume_24h") or 0,
+            "oi_usd": current_oi,
+            "d6h": snap.get("oi_change_pct_from_baseline") or 0,
+            "d1h": d1h,
+            "fr_pct": (snap.get("funding_rate") or 0) * 100,
+            "sw_days": pool_row.get("sideways_days") if pool_row else 0,
+            "in_pool": pool_row is not None,
+            "heat": 0,
+        }
+        cls = classify_trade_state(coin_data, prior_1h, prior_3h, pool_row)
+        cls["origin_strategies"] = json.loads(snap.get("origin_strategies") or "[]")
+        lifecycle_results.append((coin_data, cls))
+
+    valid_states = {"READY_LONG", "TRIGGERED_LONG", "READY_SHORT", "TRIGGERED_SHORT", "EARLY_UNDERFLOW"}
+    filtered = [(d, cls) for d, cls in lifecycle_results
+                if cls["trade_state"] in valid_states and (d.get("vol") or 0) >= 1_000_000]
+
+    if not filtered:
+        print("[setup] No tokens passed lifecycle + volume filter")
+        send_telegram_plain("\U0001f4ad Tidak ada token yang lolos filter untuk setup trade.")
+        set_app_state(conn, "last_setup_run", now_utc.strftime("%Y-%m-%dT%H:%M:%S"))
+        return
+
+    print(f"[setup] {len(filtered)} tokens passed initial filters")
+
+    import setup_engine as se
+    se.clear_caches()
+    se.set_fetch_fn(lambda sym, iv, lim: api_get("/fapi/v1/klines", {"symbol": sym, "interval": iv, "limit": lim}))
+
+    final_setups = []
+    for d, cls in filtered:
+        sym = d["sym"]
+        state = cls["trade_state"]
+        direction = "long" if state in ("READY_LONG", "TRIGGERED_LONG", "EARLY_UNDERFLOW") else "short"
+        pool_row = pool_v2_map.get(sym)
+        current_price = d.get("price", 0)
+        if not current_price or current_price <= 0:
+            continue
+
+        klines_4h = se._get_klines(sym, "4h", 180)
+        if not klines_4h or len(klines_4h) < 30:
+            continue
+
+        atr_4h = se.get_atr(klines_4h, 14)
+        swing_highs, swing_lows = se.detect_swing_points(klines_4h, 5)
+        avg_r = se._avg_range(klines_4h, 14)
+        demand_zones = se.detect_demand_zones(klines_4h)
+        supply_zones = se.detect_supply_zones(klines_4h)
+
+        best_zone = None
+        if direction == "long":
+            valid = [z for z in demand_zones if z["top"] < current_price and z["bottom"] > current_price * 0.80]
+            for z in valid:
+                sc, fr, lb = se.score_zone(z, current_price, avg_r)
+                z["_strength"] = sc; z["_freshness"] = fr; z["_strength_label"] = lb
+            valid.sort(key=lambda x: x["_strength"], reverse=True)
+            best_zone = valid[0] if valid else None
+        else:
+            valid = [z for z in supply_zones if z["bottom"] > current_price and z["top"] < current_price * 1.20]
+            for z in valid:
+                sc, fr, lb = se.score_zone(z, current_price, avg_r)
+                z["_strength"] = sc; z["_freshness"] = fr; z["_strength_label"] = lb
+            valid.sort(key=lambda x: x["_strength"], reverse=True)
+            best_zone = valid[0] if valid else None
+
+        if not best_zone:
+            continue
+
+        es = se.generate_entry_sl(sym, direction, best_zone, atr_4h, d, pool_row)
+        fm = se.validate_15m_confirmation(sym, best_zone, direction)
+        reaction = _detect_reaction(sym, best_zone, direction, current_price)
+        if reaction["reaction_type"] in ("BREAKDOWN", "BREAKOUT"):
+            continue
+
+        if reaction["confidence"] >= 2 and reaction["entry_price"] > 0:
+            entry_price = reaction["entry_price"]
+            sl_price = reaction["stop_loss"]
+        else:
+            entry_price = es["entry_mid"]
+            sl_price = es["stop_loss"]
+
+        tp_price = None
+        if direction == "long":
+            above = [sh[1] for sh in swing_highs if sh[1] > entry_price]
+            tp_price = min(above) if above else None
+        else:
+            below = [sl[1] for sl in swing_lows if sl[1] < entry_price]
+            tp_price = max(below) if below else None
+
+        risk = abs(entry_price - sl_price)
+        if not tp_price or (risk > 0 and abs(tp_price - entry_price) > risk * 5):
+            tp_price = entry_price + (risk * 2) if direction == "long" else entry_price - (risk * 2)
+
+        rr = abs(tp_price - entry_price) / risk if risk > 0 else 0
+        tscore = _score_tradeability(
+            zone_strength=best_zone.get("_strength", 0),
+            reaction_type=reaction["reaction_type"],
+            reaction_conf=reaction["confidence"],
+            confirm_15m=fm,
+            rr_ratio=rr,
+            volume=d.get("vol", 0),
+            entry_readiness=pool_row.get("entry_readiness_score") if pool_row else 0,
+        )
+        is_prime = tscore >= 75 and fm == "confirmed"
+        label = "PRIME" if is_prime else "WATCH"
+
+        final_setups.append({
+            "symbol": sym, "coin": d["coin"],
+            "direction": direction, "state": state,
+            "zone": best_zone, "zone_type": "zone",
+            "entry_price": entry_price, "stop_loss": sl_price, "tp_price": tp_price,
+            "sl_pct": round(abs(sl_price - entry_price) / entry_price * 100, 2),
+            "tp_pct": round(abs(tp_price - entry_price) / entry_price * 100, 2),
+            "rr_ratio": round(rr, 2),
+            "fifteen_m": fm,
+            "reaction_type": reaction["reaction_type"],
+            "reaction_conf": reaction["confidence"],
+            "score": tscore, "label": label,
+        })
+
+    if not final_setups:
+        print("[setup] No setups survived filtering")
+        send_telegram_plain("\U0001f4ad Tidak ada setup trade yang lolos filtering.")
+        set_app_state(conn, "last_setup_run", now_utc.strftime("%Y-%m-%dT%H:%M:%S"))
+        return
+
+    final_setups.sort(key=lambda x: x["score"], reverse=True)
+    report = _format_setup_telegram(final_setups)
+    send_telegram(report)
+    set_app_state(conn, "last_setup_run", now_utc.strftime("%Y-%m-%dT%H:%M:%S"))
+    print(f"[setup] \u2705 {len(final_setups)} setups sent to Telegram")
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "full"
     
@@ -2304,6 +2682,12 @@ def main():
     print(f"   Mode: {mode}\n")
     
     conn = init_db()
+    
+    # === Mode 'setup' — baca dari DB, tidak fetch API besar-besaran ===
+    if mode == "setup":
+        run_setup_from_db(conn)
+        conn.close()
+        return
     
     if mode in ("full", "pool"):
         # === Module A: update the accumulation pool ===
@@ -2326,7 +2710,7 @@ def main():
             else:
                 send_telegram("❌ Pool scan gagal & watchlist kosong. OI scan dilewati.")
     
-    if mode in ("full", "oi", "setup"):
+    if mode in ("full", "oi"):
         # === Combined scan: OI + funding + accumulation in one pass ===
         watchlist = load_watchlist_symbols(conn)
         watchlist_set = set(watchlist)
@@ -2933,33 +3317,13 @@ def main():
             lines.append(f"📋 **PREV WATCHED** (EARLY_UNDERFLOW 6h lalu → sekarang)")
             lines.extend(prev_lines)
 
+        # Mode 'oi' / 'full': kirim OI report lengkap seperti biasa
         report = "\n".join(lines)
-
-        # Append signal tracking recap if there are tracked signals
         tracking_recap = build_tracking_recap(conn)
         if tracking_recap:
             report += "\n" + tracking_recap
-
-        # === Generate actionable setups for 'setup' mode (every 6h) ===
-        if mode == "setup":
-            try:
-                import setup_engine
-                setup_engine.set_fetch_fn(
-                    lambda sym, iv, lim: api_get("/fapi/v1/klines", {
-                        "symbol": sym, "interval": iv, "limit": lim
-                    })
-                )
-                setup_engine.clear_caches()
-                setups = setup_engine.generate_setups(
-                    lifecycle_results, coin_data, pool_v2_map
-                )
-                setup_block = setup_engine.format_setup_report(setups)
-                if setup_block:
-                    report += "\n" + setup_block
-            except Exception as e:
-                print(f"[setup] Error: {e}")
-
         send_telegram(report)
+
         if TG_POLL_COMMANDS_IN_OI:
             check_telegram_commands(conn)
     
